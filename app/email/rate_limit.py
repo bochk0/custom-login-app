@@ -82,16 +82,6 @@ def rate_limited_forward_phase(alias_address: str) -> bool:
 
     return False
 
-
-def rate_limited_reply_phase(reply_email: str) -> bool:
-    contact = Contact.get_by(reply_email=reply_email)
-    if not contact:
-        return False
-
-    alias = contact.alias
-    return rate_limited_for_alias(alias) or rate_limited_for_mailbox(alias)
-
-
 def rate_limited(mail_from: str, rcpt_tos: [str]) -> bool:
     # todo: re-enable rate limiting
     return False
