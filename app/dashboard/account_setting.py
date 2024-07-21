@@ -198,7 +198,7 @@ def resend_email_change():
         Session.commit()
 
         send_change_email_confirmation(current_user, email_change)
-        flash("A confirmation email is on the way, please check your inbox", "success")
+        flash("A confirmation email is on the way, please check your inbox. Contact us if you run into a problem.", "success")
         return redirect(url_for("dashboard.setting"))
     else:
         flash(
@@ -226,17 +226,3 @@ def cancel_email_change():
             "You have no pending email change. Redirect back to Setting page", "warning"
         )
         return redirect(url_for("dashboard.setting"))
-
-
-@dashboard_bp.route("/unlink_proton_account", methods=["POST"])
-@login_required
-@sudo_required
-def unlink_proton_account():
-    csrf_form = CSRFValidationForm()
-    if not csrf_form.validate():
-        flash("Invalid request", "warning")
-        return redirect(url_for("dashboard.setting"))
-
-    perform_proton_account_unlink(current_user)
-    flash("Your Proton account has been unlinked", "success")
-    return redirect(url_for("dashboard.setting"))
