@@ -89,28 +89,6 @@ def mailbox_route():
                     flash("Your new mailbox is not verified", "error")
                     return redirect(url_for("dashboard.mailbox_route"))
 
-            # Schedule delete account job
-            LOG.w(
-                f"schedule delete mailbox job for {mailbox.id} with transfer to mailbox {transfer_mailbox_id}"
-            )
-            Job.create(
-                name=JOB_DELETE_MAILBOX,
-                payload={
-                    "mailbox_id": mailbox.id,
-                    "transfer_mailbox_id": transfer_mailbox_id
-                    if transfer_mailbox_id > 0
-                    else None,
-                },
-                run_at=arrow.now(),
-                commit=True,
-            )
-
-            flash(
-                f"Mailbox {mailbox.email} scheduled for deletion."
-                f"You will receive a confirmation email when the deletion is finished",
-                "success",
-            )
-
             return redirect(url_for("dashboard.mailbox_route"))
         if request.form.get("form-name") == "set-default":
             if not csrf_form.validate():
