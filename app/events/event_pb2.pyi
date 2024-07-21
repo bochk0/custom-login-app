@@ -37,20 +37,6 @@ class AliasStatusChanged(_message.Message):
     enabled: bool
     def __init__(self, alias_id: _Optional[int] = ..., alias_email: _Optional[str] = ..., enabled: bool = ...) -> None: ...
 
-class AliasDeleted(_message.Message):
-    __slots__ = ("alias_id", "alias_email")
-    ALIAS_ID_FIELD_NUMBER: _ClassVar[int]
-    ALIAS_EMAIL_FIELD_NUMBER: _ClassVar[int]
-    alias_id: int
-    alias_email: str
-    def __init__(self, alias_id: _Optional[int] = ..., alias_email: _Optional[str] = ...) -> None: ...
-
-class AliasCreatedList(_message.Message):
-    __slots__ = ("events",)
-    EVENTS_FIELD_NUMBER: _ClassVar[int]
-    events: _containers.RepeatedCompositeFieldContainer[AliasCreated]
-    def __init__(self, events: _Optional[_Iterable[_Union[AliasCreated, _Mapping]]] = ...) -> None: ...
-
 class EventContent(_message.Message):
     __slots__ = ("user_plan_change", "user_deleted", "alias_created", "alias_status_change", "alias_deleted", "alias_create_list")
     USER_PLAN_CHANGE_FIELD_NUMBER: _ClassVar[int]
