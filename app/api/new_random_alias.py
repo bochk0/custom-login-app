@@ -92,20 +92,6 @@ def new_random_alias():
                 LOG.i("Alias %s is in trash", suggested_alias)
                 alias = None
 
-    if not alias:
-        scheme = user.alias_generator
-        mode = request.args.get("mode")
-        if mode:
-            if mode == "word":
-                scheme = AliasGeneratorEnum.word.value
-            elif mode == "uuid":
-                scheme = AliasGeneratorEnum.uuid.value
-            else:
-                return jsonify(error=f"{mode} must be either word or uuid"), 400
-
-        alias = Alias.create_new_random(user=user, scheme=scheme, note=note)
-        Session.commit()
-
     if hostname and not AliasUsedOn.get_by(alias_id=alias.id, hostname=hostname):
         AliasUsedOn.create(
             alias_id=alias.id, hostname=hostname, user_id=alias.user_id, commit=True
