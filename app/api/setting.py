@@ -109,37 +109,6 @@ def update_setting():
     return jsonify(setting_to_dict(user))
 
 
-@api_bp.route("/setting/domains")
-@require_api_auth
-def get_available_domains_for_random_alias():
-    """
-    Available domains for random alias
-    """
-    user = g.user
-
-    ret = [
-        (is_sl, domain) for is_sl, domain in user.available_domains_for_random_alias()
-    ]
-
-    return jsonify(ret)
-
-
-@api_bp.route("/v2/setting/domains")
-@require_api_auth
-def get_available_domains_for_random_alias_v2():
-    """
-    Available domains for random alias
-    """
-    user = g.user
-
-    ret = [
-        {"domain": domain, "is_custom": not is_sl}
-        for is_sl, domain in user.available_domains_for_random_alias()
-    ]
-
-    return jsonify(ret)
-
-
 @api_bp.route("/setting/unlink_proton_account", methods=["DELETE"])
 @require_api_auth
 def unlink_proton_account():
