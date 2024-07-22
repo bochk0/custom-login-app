@@ -59,17 +59,6 @@ def create_mailbox():
             ),
             400,
         )
-    else:
-        new_mailbox = Mailbox.create(email=mailbox_email, user_id=user.id)
-        Session.commit()
-
-        send_verification_email(user, new_mailbox)
-
-        return (
-            jsonify(mailbox_to_dict(new_mailbox)),
-            201,
-        )
-
 
 @api_bp.route("/mailboxes/<int:mailbox_id>", methods=["DELETE"])
 @require_api_auth
@@ -98,12 +87,6 @@ def delete_mailbox(mailbox_id):
     transfer_mailbox_id = data.get("transfer_aliases_to")
     if transfer_mailbox_id and int(transfer_mailbox_id) >= 0:
         transfer_mailbox = Mailbox.get(transfer_mailbox_id)
-
-        if not transfer_mailbox or transfer_mailbox.user_id != user.id:
-            return (
-                jsonify(error="You must transfer the aliases to a mailbox you own."),
-                403,
-            )
 
         if transfer_mailbox_id == mailbox_id:
             return (
