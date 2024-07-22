@@ -34,29 +34,6 @@ def get_custom_domains():
     return jsonify(custom_domains=[custom_domain_to_dict(cd) for cd in custom_domains])
 
 
-@api_bp.route("/custom_domains/<int:custom_domain_id>/trash", methods=["GET"])
-@require_api_auth
-def get_custom_domain_trash(custom_domain_id: int):
-    user = g.user
-    custom_domain = CustomDomain.get(custom_domain_id)
-    if not custom_domain or custom_domain.user_id != user.id:
-        return jsonify(error="Forbidden"), 403
-
-    domain_deleted_aliases = DomainDeletedAlias.filter_by(
-        domain_id=custom_domain.id
-    ).all()
-
-    return jsonify(
-        aliases=[
-            {
-                "alias": dda.email,
-                "deletion_timestamp": dda.created_at.timestamp,
-            }
-            for dda in domain_deleted_aliases
-        ]
-    )
-
-
 @api_bp.route("/custom_domains/<int:custom_domain_id>", methods=["PATCH"])
 @require_api_auth
 def update_custom_domain(custom_domain_id):
