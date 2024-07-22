@@ -87,17 +87,7 @@ def update_user_info():
                 File.delete(file.id)
                 s3.delete(file.path)
                 Session.flush()
-        else:
-            raw_data = base64.decodebytes(data["profile_picture"].encode())
-            if detect_image_format(raw_data) == ImageFormat.Unknown:
-                return jsonify(error="Unsupported image format"), 400
-            file_path = random_string(30)
-            file = File.create(user_id=user.id, path=file_path)
-            Session.flush()
-            s3.upload_from_bytesio(file_path, BytesIO(raw_data))
-            user.profile_picture_id = file.id
-            Session.flush()
-
+                
     if "name" in data:
         user.name = data["name"]
 
