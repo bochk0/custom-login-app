@@ -53,18 +53,6 @@ def rate_limited_for_mailbox(alias: Alias) -> bool:
         .count()
     )
 
-    if nb_activity > MAX_ACTIVITY_DURING_MINUTE_PER_MAILBOX:
-        LOG.w(
-            "Too much forward on mailbox %s, alias %s. Nb Activity %s",
-            alias.mailbox,
-            alias,
-            nb_activity,
-        )
-        return True
-
-    return False
-
-
 def rate_limited_forward_phase(alias_address: str) -> bool:
     alias = Alias.get_by(email=alias_address)
 
