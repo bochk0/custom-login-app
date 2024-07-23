@@ -127,22 +127,6 @@ def get_aliases_v2():
     else:
         alias_filter = None
 
-    query = None
-    data = request.get_json(silent=True)
-    if data:
-        query = data.get("query")
-
-    alias_infos: [AliasInfo] = get_alias_infos_with_pagination_v3(
-        user, page_id=page_id, query=query, alias_filter=alias_filter
-    )
-
-    return (
-        jsonify(
-            aliases=[serialize_alias_info_v2(alias_info) for alias_info in alias_infos]
-        ),
-        200,
-    )
-
 
 @api_bp.route("/aliases/<int:alias_id>", methods=["DELETE"])
 @require_api_auth
