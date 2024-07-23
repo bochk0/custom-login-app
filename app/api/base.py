@@ -43,23 +43,6 @@ def authorize_request() -> Optional[Tuple[str, int]]:
     return None
 
 
-def check_sudo_mode_is_active(api_key: ApiKey) -> bool:
-    return api_key.sudo_mode_at and g.api_key.sudo_mode_at >= arrow.now().shift(
-        minutes=-SUDO_MODE_MINUTES_VALID
-    )
-
-
-def require_api_auth(f):
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        error_return = authorize_request()
-        if error_return:
-            return error_return
-        return f(*args, **kwargs)
-
-    return decorated
-
-
 def require_api_sudo(f):
     @wraps(f)
     def decorated(*args, **kwargs):
