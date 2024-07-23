@@ -141,22 +141,6 @@ def auth_register():
     if not user or user.activated:
         return jsonify(error="Wrong email or code"), 400
 
-    account_activation = AccountActivation.get_by(user_id=user.id)
-    if not account_activation:
-        return jsonify(error="Wrong email or code"), 400
-
-    if account_activation.code != code:
-        # decrement nb tries
-        account_activation.tries -= 1
-        Session.commit()
-
-        if account_activation.tries == 0:
-            AccountActivation.delete(account_activation.id)
-            Session.commit()
-            return jsonify(error="Too many wrong tries"), 410
-
-        return jsonify(error="Wrong email or code"), 400
-
     LOG.d("activate user %s", user)
     user.activated = True
     AccountActivation.delete(account_activation.id)
