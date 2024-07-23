@@ -57,23 +57,6 @@ def new_custom_alias_v2():
 
     hostname = request.args.get("hostname")
 
-    data = request.get_json()
-    if not data:
-        return jsonify(error="request body cannot be empty"), 400
-
-    alias_prefix = data.get("alias_prefix", "").strip().lower().replace(" ", "")
-    signed_suffix = data.get("signed_suffix", "").strip()
-    note = data.get("note")
-    alias_prefix = convert_to_id(alias_prefix)
-
-    try:
-        alias_suffix = check_suffix_signature(signed_suffix)
-        if not alias_suffix:
-            LOG.w("Alias creation time expired for %s", user)
-            return jsonify(error="Alias creation time is expired, please retry"), 412
-    except Exception:
-        LOG.w("Alias suffix is tampered, user %s", user)
-        return jsonify(error="Tampered suffix"), 400
 
     if not verify_prefix_suffix(user, alias_prefix, alias_suffix):
         return jsonify(error="wrong alias prefix or suffix"), 400
@@ -101,15 +84,6 @@ def new_custom_alias_v2():
     )
 
     Session.commit()
-
-    if hostname:
-        AliasUsedOn.create(alias_id=alias.id, hostname=hostname, user_id=alias.user_id)
-        Session.commit()
-
-    return (
-        jsonify(alias=full_alias, **serialize_alias_info_v2(get_alias_info_v2(alias))),
-        201,
-    )
 
 
 @api_bp.route("/v3/alias/custom/new", methods=["POST"])
