@@ -193,37 +193,6 @@ def auth_reactivate():
     return jsonify(msg="User needs to confirm their account"), 200
 
 
-@api_bp.route("/auth/facebook", methods=["POST"])
-@limiter.limit("10/minute")
-def auth_facebook():
-    """
-    Authenticate user with Facebook
-    Input:
-        facebook_token: facebook access token
-        device: to create an ApiKey associated with this device
-    Output:
-        200 and user info containing:
-        {
-            name: "John Wick",
-            mfa_enabled: true,
-            mfa_key: "a long string",
-            api_key: "a long string"
-        }
-
-    """
-    data = request.get_json()
-    if not data:
-        return jsonify(error="request body cannot be empty"), 400
-
-    facebook_token = data.get("facebook_token")
-    device = data.get("device")
-
-    graph = facebook.GraphAPI(access_token=facebook_token)
-    user_info = graph.get_object("me", fields="email,name")
-    email = sanitize_email(user_info.get("email"))
-
-    user = User.get_by(email=email)
-
     if not user:
         if DISABLE_REGISTRATION:
             return jsonify(error="registration is closed"), 400
