@@ -58,29 +58,6 @@ def token():
 
     LOG.d("Create Oauth token for user %s, client %s", auth_code.user, auth_code.client)
 
-    # Create token
-    oauth_token = OauthToken.create(
-        client_id=auth_code.client_id,
-        user_id=auth_code.user_id,
-        scope=auth_code.scope,
-        redirect_uri=auth_code.redirect_uri,
-        access_token=generate_access_token(),
-        response_type=auth_code.response_type,
-    )
-
-    client_user: ClientUser = ClientUser.get_by(
-        client_id=auth_code.client_id, user_id=auth_code.user_id
-    )
-
-    user_data = client_user.get_user_info()
-
-    res = {
-        "access_token": oauth_token.access_token,
-        "token_type": "Bearer",
-        "expires_in": 3600,
-        "scope": auth_code.scope,
-        "user": user_data,  # todo: remove this
-    }
 
     if oauth_token.scope and Scope.OPENID.value in oauth_token.scope:
         res["id_token"] = make_id_token(client_user)
