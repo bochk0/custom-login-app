@@ -163,33 +163,6 @@ def authorize():
 
             alias = None
 
-            # user creates a new alias, not using suggested alias
-            if alias_prefix:
-                # should never happen as this is checked on the front-end
-                if not current_user.can_create_new_alias():
-                    raise Exception(f"User {current_user} cannot create custom email")
-
-                alias_prefix = alias_prefix.strip().lower().replace(" ", "")
-
-                if not check_alias_prefix(alias_prefix):
-                    flash(
-                        "Only lowercase letters, numbers, dashes (-), dots (.) and underscores (_) "
-                        "are currently supported for alias prefix. Cannot be more than 40 letters",
-                        "error",
-                    )
-                    return redirect(request.url)
-
-                # hypothesis: user will click on the button in the 600 secs
-                try:
-                    alias_suffix = check_suffix_signature(signed_suffix)
-                    if not alias_suffix:
-                        LOG.w("Alias creation time expired for %s", current_user)
-                        flash("Alias creation time is expired, please retry", "warning")
-                        return redirect(request.url)
-                except Exception:
-                    LOG.w("Alias suffix is tampered, user %s", current_user)
-                    flash("Unknown error, refresh the page", "error")
-                    return redirect(request.url)
 
                 user_custom_domains = [
                     cd.domain for cd in current_user.verified_custom_domains()
@@ -279,3 +252,86 @@ def get_fragment(response_mode, response_types):
         if ResponseType.TOKEN in response_types:
             fragment = True
     return fragment
+
+
+    def construct_redirect_args(
+    client, client_user, nonce, redirect_uri, response_types, scope, state
+) -> dict:
+    redirect_args = {}
+    if state:
+        redirect_args["state"] = state
+    else:
+        LOG.w("more security reason, state should be added. client %s", client)
+    if scope:
+        redirect_args["scope"] = scope
+
+    auth_code = None
+    if ResponseType.CODE in response_types:
+        auth_code = AuthorizationCode.create(
+            client_id=client.id,
+            user_id=current_user.id,
+            code=random_string(),
+            scope=scope,
+            redirect_uri=redirect_uri,
+            response_type=response_types_to_str(response_types),
+            nonce=nonce,
+        )
+        redirect_args["code"] = auth_code.code
+
+    oauth_token = None
+    if ResponseType.TOKEN in response_types:
+        # create access-token
+        oauth_token = OauthToken.create(
+            client_id=client.id,
+            user_id=current_user.id,
+            scope=scope,
+            redirect_uri=redirect_uri,
+            access_token=generate_access_token(),
+            response_type=response_types_to_str(response_types),
+        )
+        Session.add(oauth_token)
+        redirect_args["access_token"] = oauth_token.access_token
+    if ResponseType.ID_TOKEN in response_types:
+        redirect_args["id_token"] = make_id_token(
+            client_user,
+            nonce,
+            oauth_token.access_token if oauth_token else None,
+            auth_code.code if auth_code else None,
+        )
+    Session.commit()
+    return redirect_args
+
+
+def construct_url(url, args: Dict[str, str], fragment: bool = False):
+    for i, (k, v) in enumerate(args.items()):
+        # make sure to escape v
+        v = encode_url(v)
+
+        if i == 0:
+            if fragment:
+                url += f"#{k}={v}"
+            else:
+                url += f"?{k}={v}"
+        else:
+            url += f"&{k}={v}"
+
+    return url
+
+
+def generate_access_token() -> str:
+    """generate an access-token that does not exist before"""
+    access_token = random_string(40)
+
+    if not OauthToken.get_by(access_token=access_token):
+        return access_token
+
+    # Rerun the function
+    LOG.w("access token already exists, generate a new one")
+    return generate_access_token()
+
+
+def get_host_name_and_scheme(url: str) -> (str, str):
+    """http://localhost:7777?a=b -> (localhost, http)"""
+    url_comp = urlparse(url)
+
+    return url_comp.hostname, url_comp.scheme
