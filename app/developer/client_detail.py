@@ -80,27 +80,6 @@ def client_detail(client_id):
 
         return redirect(url_for("developer.client_detail", client_id=client.id))
 
-    if action == "submit" and approval_form.validate_on_submit():
-        client.description = approval_form.description.data
-        Session.commit()
-
-        send_email(
-            ADMIN_EMAIL,
-            subject=f"{client.name} {client.id} submits for approval",
-            plaintext="",
-            html=f"""
-            name: {client.name} <br>
-            created: {client.created_at} <br>
-            user: {current_user.email} <br>
-            <br>
-            {client.description}
-            """,
-        )
-
-        flash(
-            "Thanks for submitting, we are informed and will come back to you asap!",
-            "success",
-        )
 
         return redirect(url_for("developer.client_detail", client_id=client.id))
 
