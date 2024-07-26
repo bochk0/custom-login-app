@@ -231,34 +231,7 @@ class UserAdmin(SLModelView):
 
         Session.commit()
 
-    @action(
-        "disable_otp_fido",
-        "Disable OTP & FIDO",
-        "Disable OTP & FIDO?",
-    )
-    def disable_otp_fido(self, ids):
-        for user in User.filter(User.id.in_(ids)):
-            user_had_otp = user.enable_otp
-            if user.enable_otp:
-                user.enable_otp = False
-                flash(f"Disable OTP for {user}", "info")
 
-            user_had_fido = user.fido_uuid is not None
-            if user.fido_uuid:
-                Fido.filter_by(uuid=user.fido_uuid).delete()
-                user.fido_uuid = None
-                flash(f"Disable FIDO for {user}", "info")
-            AdminAuditLog.disable_otp_fido(
-                current_user.id, user.id, user_had_otp, user_had_fido
-            )
-
-        Session.commit()
-
-    @action(
-        "stop_paddle_sub",
-        "Stop user Paddle subscription",
-        "This will stop the current user Paddle subscription so if user doesn't have Proton sub, they will lose all SL benefits immediately",
-    )
     def stop_paddle_sub(self, ids):
         for user in User.filter(User.id.in_(ids)):
             sub: Subscription = user.get_paddle_subscription()
@@ -315,13 +288,6 @@ def manual_upgrade(way: str, ids: [int], is_giveaway: bool):
             )
             continue
 
-        apple_sub: AppleSubscription = AppleSubscription.get_by(user_id=user.id)
-        if apple_sub and apple_sub.is_valid():
-            flash(
-                f"user {user} already has a Apple subscription, they have to cancel it first",
-                "warning",
-            )
-            continue
 
         AdminAuditLog.create_manual_upgrade(current_user.id, way, user.id, is_giveaway)
         manual_sub: ManualSubscription = ManualSubscription.get_by(user_id=user.id)
@@ -451,3 +417,239 @@ class ReferralAdmin(SLModelView):
     column_searchable_list = ["id", "user.email", "code", "name"]
     column_filters = ["id", "user.email", "code", "name"]
 
+    def scaffold_list_columns(self):
+        ret = super().scaffold_list_columns()
+        ret.insert(0, "nb_user")
+        ret.insert(0, "nb_paid_user")
+        return ret
+
+
+# class PayoutAdmin(SLModelView):
+#     column_searchable_list = ["id", "user.email"]
+#     column_filters = ["id", "user.email"]
+#     can_edit = True
+#     can_create = True
+#     can_delete = True
+
+
+def _admin_action_formatter(view, context, model, name):
+    action_name = AuditLogActionEnum.get_name(model.action)
+    return "{} ({})".format(action_name, model.action)
+
+
+def _admin_created_at_formatter(view, context, model, name):
+    return model.created_at.format()
+
+
+class AdminAuditLogAdmin(SLModelView):
+    form_base_class = SecureForm
+    column_searchable_list = ["admin.id", "admin.email", "model_id", "created_at"]
+    column_filters = ["admin.id", "admin.email", "model_id", "created_at"]
+    column_exclude_list = ["id"]
+    column_hide_backrefs = False
+    can_edit = False
+    can_create = False
+    can_delete = False
+
+    column_formatters = {
+        "action": _admin_action_formatter,
+        "created_at": _admin_created_at_formatter,
+    }
+
+
+def _transactionalcomplaint_state_formatter(view, context, model, name):
+    return "{} ({})".format(ProviderComplaintState(model.state).name, model.state)
+
+
+def _transactionalcomplaint_phase_formatter(view, context, model, name):
+    return Phase(model.phase).name
+
+
+def _transactionalcomplaint_refused_email_id_formatter(view, context, model, name):
+    markupstring = "<a href='{}'>{}</a>".format(
+        url_for(".download_eml", id=model.id), model.refused_email.full_report_path
+    )
+    return Markup(markupstring)
+
+
+class ProviderComplaintAdmin(SLModelView):
+    form_base_class = SecureForm
+    column_searchable_list = ["id", "user.id", "created_at"]
+    column_filters = ["user.id", "state"]
+    column_hide_backrefs = False
+    can_edit = False
+    can_create = False
+    can_delete = False
+
+    column_formatters = {
+        "created_at": _admin_created_at_formatter,
+        "updated_at": _admin_created_at_formatter,
+        "state": _transactionalcomplaint_state_formatter,
+        "phase": _transactionalcomplaint_phase_formatter,
+        "refused_email": _transactionalcomplaint_refused_email_id_formatter,
+    }
+
+    column_extra_row_actions = [  # Add a new action button
+        EndpointLinkRowAction("fa fa-check-square", ".mark_ok"),
+    ]
+
+    def _get_complaint(self) -> Optional[ProviderComplaint]:
+        complain_id = request.args.get("id")
+        if complain_id is None:
+            flash("Missing id", "error")
+            return None
+        complaint = ProviderComplaint.get_by(id=complain_id)
+        if not complaint:
+            flash("Could not find complaint", "error")
+            return None
+        return complaint
+
+    @expose("/mark_ok", methods=["GET"])
+    def mark_ok(self):
+        complaint = self._get_complaint()
+        if not complaint:
+            return redirect("/admin/transactionalcomplaint/")
+        complaint.state = ProviderComplaintState.reviewed.value
+        Session.commit()
+        return redirect("/admin/transactionalcomplaint/")
+
+    @expose("/download_eml", methods=["GET"])
+    def download_eml(self):
+        complaint = self._get_complaint()
+        if not complaint:
+            return redirect("/admin/transactionalcomplaint/")
+        eml_path = complaint.refused_email.full_report_path
+        eml_data = s3.download_email(eml_path)
+        AdminAuditLog.downloaded_provider_complaint(current_user.id, complaint.id)
+        Session.commit()
+        return Response(
+            eml_data,
+            mimetype="message/rfc822",
+            headers={
+                "Content-Disposition": "attachment;filename={}".format(
+                    complaint.refused_email.path
+                )
+            },
+        )
+
+
+def _newsletter_plain_text_formatter(view, context, model: Newsletter, name):
+    # to display newsletter plain_text with linebreaks in the list view
+    return Markup(model.plain_text.replace("\n", "<br>"))
+
+
+def _newsletter_html_formatter(view, context, model: Newsletter, name):
+    # to display newsletter html with linebreaks in the list view
+    return Markup(model.html.replace("\n", "<br>"))
+
+
+class NewsletterAdmin(SLModelView):
+    form_base_class = SecureForm
+    list_template = "admin/model/newsletter-list.html"
+    edit_template = "admin/model/newsletter-edit.html"
+    edit_modal = False
+
+    can_edit = True
+    can_create = True
+
+    column_formatters = {
+        "plain_text": _newsletter_plain_text_formatter,
+        "html": _newsletter_html_formatter,
+    }
+
+    @action(
+        "send_newsletter_to_user",
+        "Send this newsletter to myself or the specified userID",
+    )
+    def send_newsletter_to_user(self, newsletter_ids):
+        user_id = request.form["user_id"]
+        if user_id:
+            user = User.get(user_id)
+            if not user:
+                flash(f"No such user with ID {user_id}", "error")
+                return
+        else:
+            flash("use the current user", "info")
+            user = current_user
+
+        for newsletter_id in newsletter_ids:
+            newsletter = Newsletter.get(newsletter_id)
+            sent, error_msg = send_newsletter_to_user(newsletter, user)
+            if sent:
+                flash(f"{newsletter} sent to {user}", "success")
+            else:
+                flash(error_msg, "error")
+
+    @action(
+        "send_newsletter_to_address",
+        "Send this newsletter to a specific address",
+    )
+    def send_newsletter_to_address(self, newsletter_ids):
+        to_address = request.form["to_address"]
+        if not to_address:
+            flash("to_address missing", "error")
+            return
+
+        for newsletter_id in newsletter_ids:
+            newsletter = Newsletter.get(newsletter_id)
+            # use the current_user for rendering email
+            sent, error_msg = send_newsletter_to_address(
+                newsletter, current_user, to_address
+            )
+            if sent:
+                flash(
+                    f"{newsletter} sent to {to_address} with {current_user} context",
+                    "success",
+                )
+            else:
+                flash(error_msg, "error")
+
+    @action(
+        "clone_newsletter",
+        "Clone this newsletter",
+    )
+    def clone_newsletter(self, newsletter_ids):
+        if len(newsletter_ids) != 1:
+            flash("you can only select 1 newsletter", "error")
+            return
+
+        newsletter_id = newsletter_ids[0]
+        newsletter: Newsletter = Newsletter.get(newsletter_id)
+        new_newsletter = Newsletter.create(
+            subject=newsletter.subject,
+            html=newsletter.html,
+            plain_text=newsletter.plain_text,
+            commit=True,
+        )
+
+        flash(f"Newsletter {new_newsletter.subject} has been cloned", "success")
+
+
+class NewsletterUserAdmin(SLModelView):
+    form_base_class = SecureForm
+    column_searchable_list = ["id"]
+    column_filters = ["id", "user.email", "newsletter.subject"]
+    column_exclude_list = ["created_at", "updated_at", "id"]
+
+    can_edit = False
+    can_create = False
+
+
+class DailyMetricAdmin(SLModelView):
+    form_base_class = SecureForm
+    column_exclude_list = ["created_at", "updated_at", "id"]
+
+    can_export = True
+
+
+class MetricAdmin(SLModelView):
+    form_base_class = SecureForm
+    column_exclude_list = ["created_at", "updated_at", "id"]
+
+    can_export = True
+
+
+class InvalidMailboxDomainAdmin(SLModelView):
+    form_base_class = SecureForm
+    can_create = True
+    can_delete = True
