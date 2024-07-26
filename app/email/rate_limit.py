@@ -69,19 +69,3 @@ def rate_limited_forward_phase(alias_address: str) -> bool:
             return rate_limited_for_mailbox(alias)
 
     return False
-
-def rate_limited(mail_from: str, rcpt_tos: [str]) -> bool:
-    # todo: re-enable rate limiting
-    return False
-
-    for rcpt_to in rcpt_tos:
-        if is_reverse_alias(rcpt_to):
-            if rate_limited_reply_phase(rcpt_to):
-                return True
-        else:
-            # Forward phase
-            address = rcpt_to  # alias@SL
-            if rate_limited_forward_phase(address):
-                return True
-
-    return False
