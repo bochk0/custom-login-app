@@ -130,24 +130,7 @@ def update_mailbox(mailbox_id):
     """
     user = g.user
     mailbox = Mailbox.get(mailbox_id)
-
-    if not mailbox or mailbox.user_id != user.id:
-        return jsonify(error="Forbidden"), 403
-
-    data = request.get_json() or {}
-    changed = False
-    if "default" in data:
-        is_default = data.get("default")
-        if is_default:
-            if not mailbox.verified:
-                return (
-                    jsonify(
-                        error="Unverified mailbox cannot be used as default mailbox"
-                    ),
-                    400,
-                )
-            user.default_mailbox_id = mailbox.id
-            changed = True
+    
 
     if "email" in data:
         new_email = sanitize_email(data.get("email"))
