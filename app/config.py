@@ -165,15 +165,6 @@ if "DKIM_PRIVATE_KEY_PATH" in os.environ:
 DB_URI = os.environ["DB_URI"]
 DB_CONN_NAME = os.environ.get("DB_CONN_NAME", "webapp")
 
-# Flask secret
-FLASK_SECRET = os.environ["FLASK_SECRET"]
-if not FLASK_SECRET:
-    raise RuntimeError("FLASK_SECRET is empty. Please define it.")
-SESSION_COOKIE_NAME = "slapp"
-MAILBOX_SECRET = FLASK_SECRET + "mailbox"
-CUSTOM_ALIAS_SECRET = FLASK_SECRET + "custom_alias"
-UNSUBSCRIBE_SECRET = FLASK_SECRET + "unsub"
-
 # AWS
 AWS_REGION = os.environ.get("AWS_REGION") or "eu-west-3"
 BUCKET = os.environ.get("BUCKET")
