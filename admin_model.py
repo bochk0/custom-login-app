@@ -217,3 +217,237 @@ class UserAdmin(SLModelView):
 
         Session.commit()
 
+    @action(
+        "remove trial",
+        "Stop trial period",
+        "Remove trial for this user?",
+    )
+    def stop_trial(self, ids):
+        for user in User.filter(User.id.in_(ids)):
+            user.trial_end = None
+
+            flash(f"Stopped trial for {user}", "success")
+            AdminAuditLog.stop_trial(current_user.id, user.id)
+
+        Session.commit()
+
+    @action(
+        "disable_otp_fido",
+        "Disable OTP & FIDO",
+        "Disable OTP & FIDO?",
+    )
+    def disable_otp_fido(self, ids):
+        for user in User.filter(User.id.in_(ids)):
+            user_had_otp = user.enable_otp
+            if user.enable_otp:
+                user.enable_otp = False
+                flash(f"Disable OTP for {user}", "info")
+
+            user_had_fido = user.fido_uuid is not None
+            if user.fido_uuid:
+                Fido.filter_by(uuid=user.fido_uuid).delete()
+                user.fido_uuid = None
+                flash(f"Disable FIDO for {user}", "info")
+            AdminAuditLog.disable_otp_fido(
+                current_user.id, user.id, user_had_otp, user_had_fido
+            )
+
+        Session.commit()
+
+    @action(
+        "stop_paddle_sub",
+        "Stop user Paddle subscription",
+        "This will stop the current user Paddle subscription so if user doesn't have Proton sub, they will lose all SL benefits immediately",
+    )
+    def stop_paddle_sub(self, ids):
+        for user in User.filter(User.id.in_(ids)):
+            sub: Subscription = user.get_paddle_subscription()
+            if not sub:
+                flash(f"No Paddle sub for {user}", "warning")
+                continue
+
+            flash(f"{user} sub will end now, instead of {sub.next_bill_date}", "info")
+            sub.next_bill_date = (
+                arrow.now().shift(days=-PADDLE_SUBSCRIPTION_GRACE_DAYS).date()
+            )
+
+        Session.commit()
+
+    @action(
+        "clear_delete_on",
+        "Remove scheduled deletion of user",
+        "This will remove the scheduled deletion for this users",
+    )
+    def clean_delete_on(self, ids):
+        for user in User.filter(User.id.in_(ids)):
+            user.delete_on = None
+
+        Session.commit()
+
+    # @action(
+    #     "login_as",
+    #     "Login as this user",
+    #     "Login as this user?",
+    # )
+    # def login_as(self, ids):
+    #     if len(ids) != 1:
+    #         flash("only 1 user can be selected", "error")
+    #         return
+    #
+    #     for user in User.filter(User.id.in_(ids)):
+    #         AdminAuditLog.logged_as_user(current_user.id, user.id)
+    #         login_user(user)
+    #         flash(f"Login as user {user}", "success")
+    #         return redirect("/")
+
+
+def manual_upgrade(way: str, ids: [int], is_giveaway: bool):
+    for user in User.filter(User.id.in_(ids)).all():
+        if user.lifetime:
+            flash(f"user {user} already has a lifetime license", "warning")
+            continue
+
+        sub: Subscription = user.get_paddle_subscription()
+        if sub and not sub.cancelled:
+            flash(
+                f"user {user} already has a Paddle license, they have to cancel it first",
+                "warning",
+            )
+            continue
+
+        apple_sub: AppleSubscription = AppleSubscription.get_by(user_id=user.id)
+        if apple_sub and apple_sub.is_valid():
+            flash(
+                f"user {user} already has a Apple subscription, they have to cancel it first",
+                "warning",
+            )
+            continue
+
+        AdminAuditLog.create_manual_upgrade(current_user.id, way, user.id, is_giveaway)
+        manual_sub: ManualSubscription = ManualSubscription.get_by(user_id=user.id)
+        if manual_sub:
+            # renew existing subscription
+            if manual_sub.end_at > arrow.now():
+                manual_sub.end_at = manual_sub.end_at.shift(years=1)
+            else:
+                manual_sub.end_at = arrow.now().shift(years=1, days=1)
+            flash(f"Subscription extended to {manual_sub.end_at.humanize()}", "success")
+            continue
+
+        ManualSubscription.create(
+            user_id=user.id,
+            end_at=arrow.now().shift(years=1, days=1),
+            comment=way,
+            is_giveaway=is_giveaway,
+        )
+
+        flash(f"New {way} manual subscription for {user} is created", "success")
+    SesFon.commit()
+
+
+class EmailLogAdmin(SLModelView):
+    form_base_class = SecureForm
+    column_searchable_list = ["id"]
+    column_filters = ["id", "user.email", "mailbox.email", "contact.website_email"]
+
+    can_edit = False
+    can_create = False
+
+
+class AliasAdmin(SLModelView):
+    form_base_class = SecureForm
+    column_searchable_list = ["id", "user.email", "email", "mailbox.email"]
+    column_filters = ["id", "user.email", "email", "mailbox.email"]
+
+    @action(
+        "disable_email_spoofing_check",
+        "Disable email spoofing protection",
+        "Disable email spoofing protection?",
+    )
+    def disable_email_spoofing_check_for(self, ids):
+        for alias in Alias.filter(Alias.id.in_(ids)):
+            if alias.disable_email_spoofing_check:
+                flash(
+                    f"Email spoofing protection is already disabled on {alias.email}",
+                    "warning",
+                )
+            else:
+                alias.disable_email_spoofing_check = True
+                flash(
+                    f"Email spoofing protection is disabled on {alias.email}", "success"
+                )
+
+        Session.commit()
+
+
+class MailboxAdmin(SLModelView):
+    form_base_class = SecureForm
+    column_searchable_list = ["id", "user.email", "email"]
+    column_filters = ["id", "user.email", "email"]
+
+
+# class LifetimeCouponAdmin(SLModelView):
+#     can_edit = True
+#     can_create = True
+
+
+class CouponAdmin(SLModelView):
+    form_base_class = SecureForm
+    can_edit = False
+    can_create = True
+
+
+class ManualSubscriptionAdmin(SLModelView):
+    form_base_class = SecureForm
+    can_edit = True
+    column_searchable_list = ["id", "user.email"]
+
+    @action(
+        "extend_1y",
+        "Extend for 1 year",
+        "Extend 1 year more?",
+    )
+    def extend_1y(self, ids):
+        for ms in ManualSubscription.filter(ManualSubscription.id.in_(ids)):
+            ms.end_at = ms.end_at.shift(years=1)
+            flash(f"Extend subscription for 1 year for {ms.user}", "success")
+            AdminAuditLog.extend_subscription(
+                current_user.id, ms.user.id, ms.end_at, "1 year"
+            )
+
+        Session.commit()
+
+    @action(
+        "extend_1m",
+        "Extend for 1 month",
+        "Extend 1 month more?",
+    )
+    def extend_1m(self, ids):
+        for ms in ManualSubscription.filter(ManualSubscription.id.in_(ids)):
+            ms.end_at = ms.end_at.shift(months=1)
+            flash(f"Extend subscription for 1 month for {ms.user}", "success")
+            AdminAuditLog.extend_subscription(
+                current_user.id, ms.user.id, ms.end_at, "1 month"
+            )
+
+        Session.commit()
+
+
+# class ClientAdmin(SLModelView):
+#     column_searchable_list = ["name", "description", "user.email"]
+#     column_exclude_list = ["oauth_client_secret", "home_url"]
+#     can_edit = True
+
+
+class CustomDomainAdmin(SLModelView):
+    form_base_class = SecureForm
+    column_searchable_list = ["domain", "user.email", "user.id"]
+    column_exclude_list = ["ownership_txt_token"]
+    can_edit = False
+
+
+class ReferralAdmin(SLModelView):
+    form_base_class = SecureForm
+    column_searchable_list = ["id", "user.email", "code", "name"]
+    column_filters = ["id", "user.email", "code", "name"]
+
