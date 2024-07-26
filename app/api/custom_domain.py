@@ -56,24 +56,6 @@ def update_custom_domain(custom_domain_id):
     user = g.user
     custom_domain: CustomDomain = CustomDomain.get(custom_domain_id)
 
-    if not custom_domain or custom_domain.user_id != user.id:
-        return jsonify(error="Forbidden"), 403
-
-    changed = False
-    if "catch_all" in data:
-        catch_all = data.get("catch_all")
-        custom_domain.catch_all = catch_all
-        changed = True
-
-    if "random_prefix_generation" in data:
-        random_prefix_generation = data.get("random_prefix_generation")
-        custom_domain.random_prefix_generation = random_prefix_generation
-        changed = True
-
-    if "name" in data:
-        name = data.get("name")
-        custom_domain.name = name
-        changed = True
 
     if "mailbox_ids" in data:
         mailbox_ids = [int(m_id) for m_id in data.get("mailbox_ids")]
