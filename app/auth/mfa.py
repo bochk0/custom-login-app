@@ -78,26 +78,6 @@ def mfa():
             # Redirect user to correct page
             response = make_response(redirect(next_url or url_for("dashboard.index")))
 
-            if otp_token_form.remember.data:
-                browser = MfaBrowser.create_new(user=user)
-                Session.commit()
-                response.set_cookie(
-                    "mfa",
-                    value=browser.token,
-                    expires=browser.expires.datetime,
-                    secure=True if URL.startswith("https") else False,
-                    httponly=True,
-                    samesite="Lax",
-                )
-
-            return response
-
-        else:
-            flash("Incorrect token", "warning")
-            # Trigger rate limiter
-            g.deduct_limit = True
-            otp_token_form.token.data = None
-            send_invalid_totp_login_email(user, "TOTP")
 
     return render_template(
         "auth/mfa.html",
