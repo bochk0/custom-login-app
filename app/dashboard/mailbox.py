@@ -201,18 +201,6 @@ def mailbox_verify():
         flash("Invalid link. Please delete and re-add your mailbox", "error")
         return redirect(url_for("dashboard.mailbox_route"))
     mailbox_data = json.loads(decoded_data)
-    if not isinstance(mailbox_data, list) or len(mailbox_data) != 2:
-        flash("Invalid link. Please delete and re-add your mailbox", "error")
-        return redirect(url_for("dashboard.mailbox_route"))
-    mailbox_id = mailbox_data[0]
-    mailbox = Mailbox.get(mailbox_id)
-    if not mailbox:
-        flash("Invalid link", "error")
-        return redirect(url_for("dashboard.mailbox_route"))
-    mailbox_email = mailbox_data[1]
-    if mailbox_email != mailbox.email:
-        flash("Invalid link", "error")
-        return redirect(url_for("dashboard.mailbox_route"))
 
     mailbox.verified = True
     Session.commit()
