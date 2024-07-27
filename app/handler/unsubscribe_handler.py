@@ -170,25 +170,6 @@ class UnsubscribeHandler:
             LOG.w("No such user %s", user_id)
             return status.E510
 
-        if user.id != request_user.id:
-            LOG.w("Unauthorized unsubscribe user from", request_user)
-            return status.E511
-        user.notification = False
-        Session.commit()
-
-        send_email(
-            user.email,
-            "You have been unsubscribed from Login newsletter",
-            render(
-                "transactional/unsubscribe-newsletter.txt",
-                user=user,
-            ),
-            render(
-                "transactional/unsubscribe-newsletter.html",
-                user=user,
-            ),
-        )
-        return status.E202
 
     def _check_email_is_authorized_for_alias(
         self, email_address: str, alias: Alias
