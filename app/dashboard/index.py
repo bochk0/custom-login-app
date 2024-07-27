@@ -147,18 +147,6 @@ def index():
             )
         )
 
-    mailboxes = current_user.mailboxes()
-
-    show_intro = False
-    if not current_user.intro_shown:
-        LOG.d("Show intro to %s", current_user)
-        show_intro = True
-
-        # to make sure not showing intro to user again
-        current_user.intro_shown = True
-        Session.commit()
-
-    stats = get_stats(current_user)
 
     mailbox_id = None
     if alias_filter and alias_filter.startswith("mailbox:"):

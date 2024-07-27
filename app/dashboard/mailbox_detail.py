@@ -219,3 +219,92 @@ def mailbox_detail_route(mailbox_id):
     spf_available = ENFORCE_SPF
     return render_template("dashboard/mailbox_detail.html", **locals())
 
+
+def verify_mailbox_change(user, mailbox, new_email):
+    s = TimestampSigner(MAILBOX_SECRET)
+    mailbox_id_signed = s.sign(str(mailbox.id)).decode()
+    verification_url = (
+        f"{URL}/dashboard/mailbox/confirm_change?mailbox_id={mailbox_id_signed}"
+    )
+
+    send_email(
+        new_email,
+        "Confirm mailbox change on Login",
+        render(
+            "transactional/verify-mailbox-change.txt.jinja2",
+            user=user,
+            link=verification_url,
+            mailbox_email=mailbox.email,
+            mailbox_new_email=new_email,
+        ),
+        render(
+            "transactional/verify-mailbox-change.html",
+            user=user,
+            link=verification_url,
+            mailbox_email=mailbox.email,
+            mailbox_new_email=new_email,
+        ),
+    )
+
+
+@dashboard_bp.route(
+    "/mailbox/<int:mailbox_id>/cancel_email_change", methods=["GET", "POST"]
+)
+@login_required
+def cancel_mailbox_change_route(mailbox_id):
+    mailbox = Mailbox.get(mailbox_id)
+    if not mailbox or mailbox.user_id != current_user.id:
+        flash("You cannot see this page", "warning")
+        return redirect(url_for("dashboard.index"))
+
+    if mailbox.new_email:
+        mailbox.new_email = None
+        Session.commit()
+        flash("Your mailbox change is cancelled", "success")
+        return redirect(
+            url_for("dashboard.mailbox_detail_route", mailbox_id=mailbox_id)
+        )
+    else:
+        flash("You have no pending mailbox change", "warning")
+        return redirect(
+            url_for("dashboard.mailbox_detail_route", mailbox_id=mailbox_id)
+        )
+
+
+@dashboard_bp.route("/mailbox/confirm_change")
+def mailbox_confirm_change_route():
+    s = TimestampSigner(MAILBOX_SECRET)
+    signed_mailbox_id = request.args.get("mailbox_id")
+
+    try:
+        mailbox_id = int(s.unsign(signed_mailbox_id, max_age=900))
+    except Exception:
+        flash("Invalid link", "error")
+        return redirect(url_for("dashboard.index"))
+    else:
+        mailbox = Mailbox.get(mailbox_id)
+
+        # new_email can be None if user cancels change in the meantime
+        if mailbox and mailbox.new_email:
+            user = mailbox.user
+            if Mailbox.get_by(email=mailbox.new_email, user_id=user.id):
+                flash(f"{mailbox.new_email} is already used", "error")
+                return redirect(
+                    url_for("dashboard.mailbox_detail_route", mailbox_id=mailbox.id)
+                )
+
+            mailbox.email = mailbox.new_email
+            mailbox.new_email = None
+
+            # mark mailbox as verified if the change request is sent from an unverified mailbox
+            mailbox.verified = True
+            Session.commit()
+
+            LOG.d("Mailbox change %s is verified", mailbox)
+            flash(f"The {mailbox.email} is updated", "success")
+            return redirect(
+                url_for("dashboard.mailbox_detail_route", mailbox_id=mailbox.id)
+            )
+        else:
+            flash("Invalid link", "error")
+            return redirect(url_for("dashboard.index"))
