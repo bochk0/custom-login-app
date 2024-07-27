@@ -94,22 +94,6 @@ def index():
             else:
                 flash("You need to upgrade your plan to create new alias.", "warning")
 
-        elif request.form.get("form-name") == "create-random-email":
-            if current_user.can_create_new_alias():
-                scheme = int(
-                    request.form.get("generator_scheme") or current_user.alias_generator
-                )
-                if not scheme or not AliasGeneratorEnum.has_value(scheme):
-                    scheme = current_user.alias_generator
-                alias = Alias.create_new_random(user=current_user, scheme=scheme)
-
-                alias.mailbox_id = current_user.default_mailbox_id
-
-                Session.commit()
-
-                LOG.d("create new random alias %s for user %s", alias, current_user)
-                flash(f"Alias {alias.email} has been created", "success")
-
                 return redirect(
                     url_for(
                         "dashboard.index",
