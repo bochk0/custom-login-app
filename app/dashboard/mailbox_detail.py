@@ -220,33 +220,6 @@ def mailbox_detail_route(mailbox_id):
     return render_template("dashboard/mailbox_detail.html", **locals())
 
 
-def verify_mailbox_change(user, mailbox, new_email):
-    s = TimestampSigner(MAILBOX_SECRET)
-    mailbox_id_signed = s.sign(str(mailbox.id)).decode()
-    verification_url = (
-        f"{URL}/dashboard/mailbox/confirm_change?mailbox_id={mailbox_id_signed}"
-    )
-
-    send_email(
-        new_email,
-        "Confirm mailbox change on Login",
-        render(
-            "transactional/verify-mailbox-change.txt.jinja2",
-            user=user,
-            link=verification_url,
-            mailbox_email=mailbox.email,
-            mailbox_new_email=new_email,
-        ),
-        render(
-            "transactional/verify-mailbox-change.html",
-            user=user,
-            link=verification_url,
-            mailbox_email=mailbox.email,
-            mailbox_new_email=new_email,
-        ),
-    )
-
-
 @dashboard_bp.route(
     "/mailbox/<int:mailbox_id>/cancel_email_change", methods=["GET", "POST"]
 )
