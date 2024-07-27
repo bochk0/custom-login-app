@@ -63,19 +63,7 @@ class UnsubscribeEncoder:
                 raise ValueError(
                     f"Data has to be an UnsubscribeOriginalData for an action of type {action}"
                 )
-            # Initial 0 is the version number. If we need to add support for extra use-cases we can bump up this number
-            data = (0, data.alias_id, data.recipient, data.subject)
-        payload = (action.value, data)
-        serialized_data = (
-            base64.urlsafe_b64encode(json.dumps(payload).encode("utf-8"))
-            .rstrip(b"=")
-            .decode("utf-8")
-        )
-        signed_data = cls._get_signer().sign(serialized_data).decode("utf-8")
-        encoded_request = f"{UNSUB_PREFIX}.{signed_data}"
-        if len(encoded_request) > 512:
-            LOG.w("Encoded request is longer than 512 chars")
-        return encoded_request
+                
 
     @staticmethod
     def encode_mailto(
