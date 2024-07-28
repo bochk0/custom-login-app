@@ -81,26 +81,7 @@ def custom_domain():
                     Session.commit()
 
                     mailbox_ids = request.form.getlist("mailbox_ids")
-                    if mailbox_ids:
-                        # check if mailbox is not tempered with
-                        mailboxes = []
-                        for mailbox_id in mailbox_ids:
-                            mailbox = Mailbox.get(mailbox_id)
-                            if (
-                                not mailbox
-                                or mailbox.user_id != current_user.id
-                                or not mailbox.verified
-                            ):
-                                flash("Something went wrong, please retry", "warning")
-                                return redirect(url_for("dashboard.custom_domain"))
-                            mailboxes.append(mailbox)
 
-                        for mailbox in mailboxes:
-                            DomainMailbox.create(
-                                domain_id=new_custom_domain.id, mailbox_id=mailbox.id
-                            )
-
-                        Session.commit()
 
                     flash(
                         f"New domain {new_custom_domain.domain} is created", "success"
