@@ -221,29 +221,6 @@ def send_cannot_create_directory_alias(user, alias_address, directory_name):
     )
 
 
-def send_cannot_create_directory_alias_disabled(user, alias_address, directory_name):
-    """when the directory is disabled, new alias can't be created on-the-fly.
-    Send user an email to notify of an attempt
-    """
-    send_email_with_rate_control(
-        user,
-        config.ALERT_DIRECTORY_DISABLED_ALIAS_CREATION,
-        user.email,
-        f"Alias {alias_address} cannot be created",
-        render(
-            "transactional/cannot-create-alias-directory-disabled.txt",
-            user=user,
-            alias=alias_address,
-            directory=directory_name,
-        ),
-        render(
-            "transactional/cannot-create-alias-directory-disabled.html",
-            user=user,
-            alias=alias_address,
-            directory=directory_name,
-        ),
-    )
-
 
 def send_cannot_create_domain_alias(user, alias, domain):
     """when user cancels their subscription, they cannot create alias on the fly with custom domain.
@@ -1232,3 +1209,111 @@ def parse_address_list(address_list: str) -> List[Tuple[str, str]]:
 
 
 def parse_full_address(full_address) -> (str, str):
+
+    full_address: EmailAddress = address.parse(full_address)
+    if full_address is None:
+        raise ValueError
+
+    # address.parse can also parse a URL and return UrlAddress
+    if type(full_address) is not EmailAddress:
+        raise ValueError
+
+    return full_address.display_name, full_address.address
+
+
+def save_email_for_debugging(msg: Message, file_name_prefix=None) -> str:
+    """Save email for debugging to temporary location
+    Return the file path
+    """
+    if config.TEMP_DIR:
+        file_name = str(uuid.uuid4()) + ".eml"
+        if file_name_prefix:
+            file_name = "{}-{}".format(file_name_prefix, file_name)
+
+        with open(os.path.join(config.TEMP_DIR, file_name), "wb") as f:
+            f.write(msg.as_bytes())
+
+        LOG.d("email saved to %s", file_name)
+        return file_name
+
+    return ""
+
+
+def save_envelope_for_debugging(envelope: Envelope, file_name_prefix=None) -> str:
+    """Save envelope for debugging to temporary location
+    Return the file path
+    """
+    if config.TEMP_DIR:
+        file_name = str(uuid.uuid4()) + ".eml"
+        if file_name_prefix:
+            file_name = "{}-{}".format(file_name_prefix, file_name)
+
+        with open(os.path.join(config.TEMP_DIR, file_name), "wb") as f:
+            f.write(envelope.original_content)
+
+        LOG.d("envelope saved to %s", file_name)
+        return file_name
+
+    return ""
+
+
+def generate_verp_email(
+    verp_type: VerpType, object_id: int, sender_domain: Optional[str] = None
+) -> str:
+
+    data = [
+        verp_type.value,
+        object_id or 0,
+        int((time.time() - VERP_TIME_START) / 60),
+    ]
+    json_payload = json.dumps(data).encode("utf-8")
+    payload_hmac = hmac.new(
+        config.VERP_EMAIL_SECRET.encode("utf-8"), json_payload, VERP_HMAC_ALGO
+    ).digest()[:8]
+    encoded_payload = base64.b32encode(json_payload).rstrip(b"=").decode("utf-8")
+    encoded_signature = base64.b32encode(payload_hmac).rstrip(b"=").decode("utf-8")
+    return "{}.{}.{}@{}".format(
+        config.VERP_PREFIX,
+        encoded_payload,
+        encoded_signature,
+        sender_domain or config.EMAIL_DOMAIN,
+    ).lower()
+
+
+def get_verp_info_from_email(email: str) -> Optional[Tuple[VerpType, int]]:
+    idx = email.find("@")
+    if idx == -1:
+        return None
+    username = email[:idx]
+    fields = username.split(".")
+    if len(fields) != 3 or fields[0] != config.VERP_PREFIX:
+        return None
+    try:
+        padding = (8 - (len(fields[1]) % 8)) % 8
+        payload = base64.b32decode(fields[1].encode("utf-8").upper() + (b"=" * padding))
+        padding = (8 - (len(fields[2]) % 8)) % 8
+        signature = base64.b32decode(
+            fields[2].encode("utf-8").upper() + (b"=" * padding)
+        )
+    except binascii.Error:
+        return None
+    expected_signature = hmac.new(
+        config.VERP_EMAIL_SECRET.encode("utf-8"), payload, VERP_HMAC_ALGO
+    ).digest()[:8]
+    if expected_signature != signature:
+        return None
+    data = json.loads(payload)
+    # verp type, object_id, time
+    if len(data) != 3:
+        return None
+    if data[2] > (time.time() + config.VERP_MESSAGE_LIFETIME - VERP_TIME_START) / 60:
+        return None
+    return VerpType(data[0]), data[1]
+
+
+def sl_formataddr(name_address_tuple: Tuple[str, str]):
+    """Same as formataddr but use utf-8 encoding by default and always return str (and never Header)"""
+    name, addr = name_address_tuple
+    # formataddr can return Header, make sure to convert to str
+    return str(formataddr((name, Header(addr, "utf-8"))))
+
