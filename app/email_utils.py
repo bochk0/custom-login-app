@@ -199,25 +199,6 @@ def send_invalid_totp_login_email(user, totp_type):
     )
 
 
-def send_test_email_alias(user: User, email: str):
-    send_email(
-        email,
-        f"This email is sent to {email}",
-        render(
-            "transactional/test-email.txt",
-            user=user,
-            name=user.name,
-            alias=email,
-        ),
-        render(
-            "transactional/test-email.html",
-            user=user,
-            name=user.name,
-            alias=email,
-        ),
-    )
-
-
 def send_cannot_create_directory_alias(user, alias_address, directory_name):
     """when user cancels their subscription, they cannot create alias on the fly.
     If this happens, send them an email to notify
@@ -262,3 +243,219 @@ def send_cannot_create_directory_alias_disabled(user, alias_address, directory_n
             directory=directory_name,
         ),
     )
+
+
+def send_cannot_create_domain_alias(user, alias, domain):
+    """when user cancels their subscription, they cannot create alias on the fly with custom domain.
+    If this happens, send them an email to notify
+    """
+    send_email(
+        user.email,
+        f"Alias {alias} cannot be created",
+        render(
+            "transactional/cannot-create-alias-domain.txt",
+            user=user,
+            alias=alias,
+            domain=domain,
+        ),
+        render(
+            "transactional/cannot-create-alias-domain.html",
+            user=user,
+            alias=alias,
+            domain=domain,
+        ),
+    )
+
+
+def send_email(
+    to_email,
+    subject,
+    plaintext,
+    html=None,
+    unsubscribe_link=None,
+    unsubscribe_via_email=False,
+    retries=0,  # by default no retry if sending fails
+    ignore_smtp_error=False,
+    from_name=None,
+    from_addr=None,
+):
+    to_email = sanitize_email(to_email)
+
+    LOG.d("send email to %s, subject '%s'", to_email, subject)
+
+    from_name = from_name or config.NOREPLY
+    from_addr = from_addr or config.NOREPLY
+    from_domain = get_email_domain_part(from_addr)
+
+    if html:
+        msg = MIMEMultipart("alternative")
+        msg.attach(MIMEText(plaintext))
+        msg.attach(MIMEText(html, "html"))
+    else:
+        msg = EmailMessage()
+        msg.set_payload(plaintext)
+        msg[headers.CONTENT_TYPE] = "text/plain"
+
+    msg[headers.SUBJECT] = subject
+    msg[headers.FROM] = f'"{from_name}" <{from_addr}>'
+    msg[headers.TO] = to_email
+
+    msg_id_header = make_msgid(domain=config.EMAIL_DOMAIN)
+    msg[headers.MESSAGE_ID] = msg_id_header
+
+    date_header = formatdate()
+    msg[headers.DATE] = date_header
+
+    if headers.MIME_VERSION not in msg:
+        msg[headers.MIME_VERSION] = "1.0"
+
+    if unsubscribe_link:
+        add_or_replace_header(msg, headers.LIST_UNSUBSCRIBE, f"<{unsubscribe_link}>")
+        if not unsubscribe_via_email:
+            add_or_replace_header(
+                msg, headers.LIST_UNSUBSCRIBE_POST, "List-Unsubscribe=One-Click"
+            )
+
+    # add DKIM
+    email_domain = from_addr[from_addr.find("@") + 1 :]
+    add_dkim_signature(msg, email_domain)
+
+    transaction = TransactionalEmail.create(email=to_email, commit=True)
+
+    # use a different envelope sender for each transactional email (aka VERP)
+    sl_sendmail(
+        generate_verp_email(VerpType.transactional, transaction.id, from_domain),
+        to_email,
+        msg,
+        retries=retries,
+        ignore_smtp_error=ignore_smtp_error,
+    )
+
+
+def send_email_with_rate_control(
+    user: User,
+    alert_type: str,
+    to_email: str,
+    subject,
+    plaintext,
+    html=None,
+    max_nb_alert=config.MAX_ALERT_24H,
+    nb_day=1,
+    ignore_smtp_error=False,
+    retries=0,
+) -> bool:
+    """Same as send_email with rate control over alert_type.
+    Make sure no more than `max_nb_alert` emails are sent over the period of `nb_day` days
+
+    Return true if the email is sent, otherwise False
+    """
+    to_email = sanitize_email(to_email)
+    min_dt = arrow.now().shift(days=-1 * nb_day)
+    nb_alert = (
+        SentAlert.filter_by(alert_type=alert_type, to_email=to_email)
+        .filter(SentAlert.created_at > min_dt)
+        .count()
+    )
+
+    if nb_alert >= max_nb_alert:
+        LOG.w(
+            "%s emails were sent to %s in the last %s days, alert type %s",
+            nb_alert,
+            to_email,
+            nb_day,
+            alert_type,
+        )
+        return False
+
+    SentAlert.create(user_id=user.id, alert_type=alert_type, to_email=to_email)
+    Session.commit()
+
+    if ignore_smtp_error:
+        try:
+            send_email(to_email, subject, plaintext, html, retries=retries)
+        except SMTPException:
+            LOG.w("Cannot send email to %s, subject %s", to_email, subject)
+    else:
+        send_email(to_email, subject, plaintext, html, retries=retries)
+
+    return True
+
+
+def send_email_at_most_times(
+    user: User,
+    alert_type: str,
+    to_email: str,
+    subject,
+    plaintext,
+    html=None,
+    max_times=1,
+) -> bool:
+    """Same as send_email with rate control over alert_type.
+    Sent at most `max_times`
+    This is used to inform users about a warning.
+
+    Return true if the email is sent, otherwise False
+    """
+    to_email = sanitize_email(to_email)
+    nb_alert = SentAlert.filter_by(alert_type=alert_type, to_email=to_email).count()
+
+    if nb_alert >= max_times:
+        LOG.w(
+            "%s emails were sent to %s alert type %s",
+            nb_alert,
+            to_email,
+            alert_type,
+        )
+        return False
+
+    SentAlert.create(user_id=user.id, alert_type=alert_type, to_email=to_email)
+    Session.commit()
+    send_email(to_email, subject, plaintext, html)
+    return True
+
+
+def get_email_local_part(address) -> str:
+    """
+    Get the local part from email
+    ab@cd.com -> ab
+    Convert the local part to lowercase
+    """
+    r: ValidatedEmail = validate_email(
+        address, check_deliverability=False, allow_smtputf8=False
+    )
+    return r.local_part.lower()
+
+
+def get_email_domain_part(address):
+    """
+    Get the domain part from email
+    ab@cd.com -> cd.com
+    """
+    address = sanitize_email(address)
+    return address[address.find("@") + 1 :]
+
+
+def add_dkim_signature(msg: Message, email_domain: str):
+    if config.RSPAMD_SIGN_DKIM:
+        LOG.d("DKIM signature will be added by rspamd")
+        msg[headers.SL_WANT_SIGNING] = "yes"
+        return
+
+    for dkim_headers in headers.DKIM_HEADERS:
+        try:
+            add_dkim_signature_with_header(msg, email_domain, dkim_headers)
+            return
+        except dkim.DKIMException:
+            LOG.w("DKIM fail with %s", dkim_headers, exc_info=True)
+            # try with another headers
+            continue
+
+    # To investigate why some emails can't be DKIM signed. todo: remove
+    if config.TEMP_DIR:
+        file_name = str(uuid.uuid4()) + ".eml"
+        with open(os.path.join(config.TEMP_DIR, file_name), "wb") as f:
+            f.write(msg.as_bytes())
+
+        LOG.w("email saved to %s", file_name)
+
+    raise Exception("Cannot create DKIM signature")
