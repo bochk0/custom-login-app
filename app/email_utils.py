@@ -894,11 +894,6 @@ def add_header(
             return clone_msg
         parts = list(payload)
         LOG.d("only add header for the first part for %s", content_type)
-        for ix, part in enumerate(parts):
-            if ix == 0:
-                new_parts.append(add_header(part, text_header, html_header))
-            else:
-                new_parts.append(part)
 
         clone_msg = copy(msg)
         clone_msg.set_payload(new_parts)
@@ -946,19 +941,7 @@ def replace(msg: Union[Message, str], old, new) -> Union[Message, str]:
                 clone_msg = copy(msg)
                 clone_msg.set_payload(quopri.encodestring(new_payload.encode()))
                 return clone_msg
-            elif encoding == EmailEncoding.BASE64:
-                new_payload = decode_text(payload, encoding).replace(old, new)
-                new_payload = base64.b64encode(new_payload.encode("utf-8"))
-                clone_msg = copy(msg)
-                clone_msg.set_payload(new_payload)
-                return clone_msg
-            else:
-                clone_msg = copy(msg)
-                new_payload = payload.replace(
-                    encode_text(old, encoding), encode_text(new, encoding)
-                )
-                clone_msg.set_payload(new_payload)
-                return clone_msg
+
 
     elif content_type in (
         "multipart/alternative",
@@ -1042,3 +1025,210 @@ def should_disable(alias: Alias) -> (bool, str):
 
     if not config.ALIAS_AUTOMATIC_DISABLE:
         return False, ""
+
+        yesterday = arrow.now().shift(days=-1)
+    nb_bounced_last_24h = (
+        Session.query(EmailLog)
+        .filter(
+            EmailLog.bounced.is_(True),
+            EmailLog.is_reply.is_(False),
+            EmailLog.created_at > yesterday,
+        )
+        .filter(EmailLog.alias_id == alias.id)
+        .count()
+    )
+    # if more than 12 bounces in 24h -> disable alias
+    if nb_bounced_last_24h > 12:
+        return True, "+12 bounces in the last 24h"
+
+    # if more than 5 bounces but has +10 bounces last week -> disable alias
+    elif nb_bounced_last_24h > 5:
+        one_week_ago = arrow.now().shift(days=-7)
+        nb_bounced_7d_1d = (
+            Session.query(EmailLog)
+            .filter(
+                EmailLog.bounced.is_(True),
+                EmailLog.is_reply.is_(False),
+                EmailLog.created_at > one_week_ago,
+                EmailLog.created_at < yesterday,
+            )
+            .filter(EmailLog.alias_id == alias.id)
+            .count()
+        )
+        if nb_bounced_7d_1d > 10:
+            return (
+                True,
+                "+5 bounces in the last 24h and +10 bounces in the last 7 days",
+            )
+    else:
+        # alias level
+        # if bounces happen for at least 9 days in the last 10 days -> disable alias
+        query = (
+            Session.query(
+                func.date(EmailLog.created_at).label("date"),
+                func.count(EmailLog.id).label("count"),
+            )
+            .filter(EmailLog.alias_id == alias.id)
+            .filter(
+                EmailLog.created_at > arrow.now().shift(days=-10),
+                EmailLog.bounced.is_(True),
+                EmailLog.is_reply.is_(False),
+            )
+            .group_by("date")
+        )
+
+        if query.count() >= 9:
+            return True, "Bounces every day for at least 9 days in the last 10 days"
+
+        # account level
+        query = (
+            Session.query(
+                func.date(EmailLog.created_at).label("date"),
+                func.count(EmailLog.id).label("count"),
+            )
+            .filter(EmailLog.user_id == alias.user_id)
+            .filter(
+                EmailLog.created_at > arrow.now().shift(days=-10),
+                EmailLog.bounced.is_(True),
+                EmailLog.is_reply.is_(False),
+            )
+            .group_by("date")
+        )
+
+        # if an account has more than 10 bounces every day for at least 4 days in the last 10 days, disable alias
+        date_bounces: List[Tuple[arrow.Arrow, int]] = list(query)
+        more_than_10_bounces = [
+            (d, nb_bounce) for d, nb_bounce in date_bounces if nb_bounce > 10
+        ]
+        if len(more_than_10_bounces) > 4:
+            return True, "+10 bounces for +4 days in the last 10 days"
+
+    return False, ""
+
+
+def parse_id_from_bounce(email_address: str) -> int:
+    return int(email_address[email_address.find("+") : email_address.rfind("+")])
+
+
+def spf_pass(
+    envelope,
+    mailbox: Mailbox,
+    user: User,
+    alias: Alias,
+    contact_email: str,
+    msg: Message,
+) -> bool:
+    ip = msg[headers.SL_CLIENT_IP]
+    if ip:
+        LOG.d("Enforce SPF on %s %s", ip, envelope.mail_from)
+        try:
+            r = spf.check2(i=ip, s=envelope.mail_from, h=None)
+        except Exception:
+            LOG.e("SPF error, mailbox %s, ip %s", mailbox.email, ip)
+        else:
+            # TODO: Handle temperr case (e.g. dns timeout)
+            # only an absolute pass, or no SPF policy at all is 'valid'
+            if r[0] not in ["pass", "none"]:
+                LOG.w(
+                    "SPF fail for mailbox %s, reason %s, failed IP %s",
+                    mailbox.email,
+                    r[0],
+                    ip,
+                )
+                subject = get_header_unicode(msg[headers.SUBJECT])
+                send_email_with_rate_control(
+                    user,
+                    config.ALERT_SPF,
+                    mailbox.email,
+                    f"Login Alert: attempt to send emails from your alias {alias.email} from unknown IP Address",
+                    render(
+                        "transactional/spf-fail.txt",
+                        user=user,
+                        alias=alias.email,
+                        ip=ip,
+                        mailbox_url=config.URL + f"/dashboard/mailbox/{mailbox.id}#spf",
+                        to_email=contact_email,
+                        subject=subject,
+                        time=arrow.now(),
+                    ),
+                    render(
+                        "transactional/spf-fail.html",
+                        user=user,
+                        ip=ip,
+                        mailbox_url=config.URL + f"/dashboard/mailbox/{mailbox.id}#spf",
+                        to_email=contact_email,
+                        subject=subject,
+                        time=arrow.now(),
+                    ),
+                )
+                return False
+
+    else:
+        LOG.w(
+            "Could not find %s header %s -> %s",
+            headers.SL_CLIENT_IP,
+            mailbox.email,
+            contact_email,
+        )
+
+    return True
+
+
+# cache the smtp server for 20 seconds
+@cached(cache=TTLCache(maxsize=2, ttl=20))
+def get_smtp_server():
+    LOG.d("get a smtp server")
+    if config.POSTFIX_SUBMISSION_TLS:
+        smtp = SMTP(config.POSTFIX_SERVER, 587)
+        smtp.starttls()
+    else:
+        smtp = SMTP(config.POSTFIX_SERVER, config.POSTFIX_PORT)
+
+    return smtp
+
+
+def get_queue_id(msg: Message) -> Optional[str]:
+    """Get the Postfix queue-id from a message"""
+    header_values = msg.get_all(headers.RSPAMD_QUEUE_ID)
+    if header_values:
+        # Get last in case somebody tries to inject a header
+        return header_values[-1]
+
+    received_header = str(msg[headers.RECEIVED])
+    if not received_header:
+        return
+
+    # received_header looks like 'from mail-wr1-x434.google.com (mail-wr1-x434.google.com [IPv6:2a00:1450:4864:20::434])\r\n\t(using TLSv1.3 with cipher TLS_AES_128_GCM_SHA256 (128/128 bits))\r\n\t(No client certificate requested)\r\n\tby mx1.login.co (Postfix) with ESMTPS id 4FxQmw1DXdz2vK2\r\n\tfor <jglfdjgld@alias.com>; Fri,  4 Jun 2021 14:55:43 +0000 (UTC)'
+    search_result = re.search("with ESMTPS id [0-9a-zA-Z]{1,}", received_header)
+    if not search_result:
+        return
+
+    # the "with ESMTPS id 4FxQmw1DXdz2vK2" part
+    with_esmtps = received_header[search_result.start() : search_result.end()]
+
+    return with_esmtps[len("with ESMTPS id ") :]
+
+
+def should_ignore_bounce(mail_from: str) -> bool:
+    if IgnoreBounceSender.get_by(mail_from=mail_from):
+        LOG.w("do not send back bounce report to %s", mail_from)
+        return True
+
+    return False
+
+
+def parse_address_list(address_list: str) -> List[Tuple[str, str]]:
+    """
+    Parse a list of email addresses from a header in the form "ab <ab@sd.com>, cd <cd@cd.com>"
+    and return a list [("ab", "ab@sd.com"),("cd", "cd@cd.com")]
+    """
+    processed_addresses = []
+    for split_address in address_list.split(","):
+        split_address = split_address.strip()
+        if not split_address:
+            continue
+        processed_addresses.append(parse_full_address(split_address))
+    return processed_addresses
+
+
+def parse_full_address(full_address) -> (str, str):
