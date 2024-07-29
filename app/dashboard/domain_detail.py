@@ -198,21 +198,6 @@ def domain_detail(custom_domain_id):
             return redirect(
                 url_for("dashboard.domain_detail", custom_domain_id=custom_domain.id)
             )
-        elif request.form.get("form-name") == "set-name":
-            if request.form.get("action") == "save":
-                custom_domain.name = request.form.get("alias-name").replace("\n", "")
-                Session.commit()
-                flash(
-                    f"Default alias name for Domain {custom_domain.domain} has been set",
-                    "success",
-                )
-            else:
-                custom_domain.name = None
-                Session.commit()
-                flash(
-                    f"Default alias name for Domain {custom_domain.domain} has been removed",
-                    "info",
-                )
 
             return redirect(
                 url_for("dashboard.domain_detail", custom_domain_id=custom_domain.id)
@@ -263,3 +248,266 @@ def domain_detail(custom_domain_id):
                     )
                 )
 
+# first remove all existing domain-mailboxes links
+            DomainMailbox.filter_by(domain_id=custom_domain.id).delete()
+            Session.flush()
+
+            for mailbox in mailboxes:
+                DomainMailbox.create(domain_id=custom_domain.id, mailbox_id=mailbox.id)
+
+            Session.commit()
+            flash(f"{custom_domain.domain} mailboxes has been updated", "success")
+
+            return redirect(
+                url_for("dashboard.domain_detail", custom_domain_id=custom_domain.id)
+            )
+
+        elif request.form.get("form-name") == "delete":
+            name = custom_domain.domain
+            LOG.d("Schedule deleting %s", custom_domain)
+
+            # Schedule delete domain job
+            LOG.w("schedule delete domain job for %s", custom_domain)
+            Job.create(
+                name=JOB_DELETE_DOMAIN,
+                payload={"custom_domain_id": custom_domain.id},
+                run_at=arrow.now(),
+                commit=True,
+            )
+
+            flash(
+                f"{name} scheduled for deletion."
+                f"You will receive a confirmation email when the deletion is finished",
+                "success",
+            )
+
+            if custom_domain.is_sl_subdomain:
+                return redirect(url_for("dashboard.subdomain_route"))
+            else:
+                return redirect(url_for("dashboard.custom_domain"))
+
+    nb_alias = Alias.filter_by(custom_domain_id=custom_domain.id).count()
+
+    return render_template("dashboard/domain_detail/info.html", **locals())
+
+
+@dashboard_bp.route("/domains/<int:custom_domain_id>/trash", methods=["GET", "POST"])
+@login_required
+def domain_detail_trash(custom_domain_id):
+    csrf_form = CSRFValidationForm()
+    custom_domain = CustomDomain.get(custom_domain_id)
+    if not custom_domain or custom_domain.user_id != current_user.id:
+        flash("You cannot see this page", "warning")
+        return redirect(url_for("dashboard.index"))
+
+    if request.method == "POST":
+        if not csrf_form.validate():
+            flash("Invalid request", "warning")
+            return redirect(request.url)
+        if request.form.get("form-name") == "empty-all":
+            DomainDeletedAlias.filter_by(domain_id=custom_domain.id).delete()
+            Session.commit()
+
+            flash("All deleted aliases can now be re-created", "success")
+            return redirect(
+                url_for(
+                    "dashboard.domain_detail_trash", custom_domain_id=custom_domain.id
+                )
+            )
+        elif request.form.get("form-name") == "remove-single":
+            deleted_alias_id = request.form.get("deleted-alias-id")
+            deleted_alias = DomainDeletedAlias.get(deleted_alias_id)
+            if not deleted_alias or deleted_alias.domain_id != custom_domain.id:
+                flash("Unknown error, refresh the page", "warning")
+                return redirect(
+                    url_for(
+                        "dashboard.domain_detail_trash",
+                        custom_domain_id=custom_domain.id,
+                    )
+                )
+
+            DomainDeletedAlias.delete(deleted_alias.id)
+            Session.commit()
+            flash(
+                f"{deleted_alias.email} can now be re-created",
+                "success",
+            )
+
+            return redirect(
+                url_for(
+                    "dashboard.domain_detail_trash", custom_domain_id=custom_domain.id
+                )
+            )
+
+    domain_deleted_aliases = DomainDeletedAlias.filter_by(
+        domain_id=custom_domain.id
+    ).all()
+
+    return render_template(
+        "dashboard/domain_detail/trash.html",
+        domain_deleted_aliases=domain_deleted_aliases,
+        custom_domain=custom_domain,
+        csrf_form=csrf_form,
+    )
+
+
+class AutoCreateRuleForm(FlaskForm):
+    regex = StringField(
+        "regex", validators=[validators.DataRequired(), validators.Length(max=128)]
+    )
+
+    order = IntegerField(
+        "order",
+        validators=[validators.DataRequired(), validators.NumberRange(min=0, max=100)],
+    )
+
+
+class AutoCreateTestForm(FlaskForm):
+    local = StringField(
+        "local part", validators=[validators.DataRequired(), validators.Length(max=128)]
+    )
+
+
+@dashboard_bp.route(
+    "/domains/<int:custom_domain_id>/auto-create", methods=["GET", "POST"]
+)
+@login_required
+def domain_detail_auto_create(custom_domain_id):
+    custom_domain: CustomDomain = CustomDomain.get(custom_domain_id)
+    mailboxes = current_user.mailboxes()
+    new_auto_create_rule_form = AutoCreateRuleForm()
+
+    auto_create_test_form = AutoCreateTestForm()
+    auto_create_test_local, auto_create_test_result, auto_create_test_passed = (
+        "",
+        "",
+        False,
+    )
+
+    if not custom_domain or custom_domain.user_id != current_user.id:
+        flash("You cannot see this page", "warning")
+        return redirect(url_for("dashboard.index"))
+
+    if request.method == "POST":
+        if request.form.get("form-name") == "create-auto-create-rule":
+            if new_auto_create_rule_form.validate():
+                # make sure order isn't used before
+                for auto_create_rule in custom_domain.auto_create_rules:
+                    auto_create_rule: AutoCreateRule
+                    if auto_create_rule.order == int(
+                        new_auto_create_rule_form.order.data
+                    ):
+                        flash(
+                            "Another rule with the same order already exists", "error"
+                        )
+                        break
+                else:
+                    mailbox_ids = request.form.getlist("mailbox_ids")
+                    # check if mailbox is not tempered with
+                    mailboxes = []
+                    for mailbox_id in mailbox_ids:
+                        mailbox = Mailbox.get(mailbox_id)
+                        if (
+                            not mailbox
+                            or mailbox.user_id != current_user.id
+                            or not mailbox.verified
+                        ):
+                            flash("Something went wrong, please retry", "warning")
+                            return redirect(
+                                url_for(
+                                    "dashboard.domain_detail_auto_create",
+                                    custom_domain_id=custom_domain.id,
+                                )
+                            )
+                        mailboxes.append(mailbox)
+
+                    if not mailboxes:
+                        flash("You must select at least 1 mailbox", "warning")
+                        return redirect(
+                            url_for(
+                                "dashboard.domain_detail_auto_create",
+                                custom_domain_id=custom_domain.id,
+                            )
+                        )
+
+                    try:
+                        re.compile(new_auto_create_rule_form.regex.data)
+                    except Exception:
+                        flash(
+                            f"Invalid regex {new_auto_create_rule_form.regex.data}",
+                            "error",
+                        )
+                        return redirect(
+                            url_for(
+                                "dashboard.domain_detail_auto_create",
+                                custom_domain_id=custom_domain.id,
+                            )
+                        )
+
+                    rule = AutoCreateRule.create(
+                        custom_domain_id=custom_domain.id,
+                        order=int(new_auto_create_rule_form.order.data),
+                        regex=new_auto_create_rule_form.regex.data,
+                        flush=True,
+                    )
+
+                    for mailbox in mailboxes:
+                        AutoCreateRuleMailbox.create(
+                            auto_create_rule_id=rule.id, mailbox_id=mailbox.id
+                        )
+
+                    Session.commit()
+
+                    flash("New auto create rule has been created", "success")
+
+                    return redirect(
+                        url_for(
+                            "dashboard.domain_detail_auto_create",
+                            custom_domain_id=custom_domain.id,
+                        )
+                    )
+        elif request.form.get("form-name") == "delete-auto-create-rule":
+            rule_id = request.form.get("rule-id")
+            rule: AutoCreateRule = AutoCreateRule.get(int(rule_id))
+
+            if not rule or rule.custom_domain_id != custom_domain.id:
+                flash("Something wrong, please retry", "error")
+                return redirect(
+                    url_for(
+                        "dashboard.domain_detail_auto_create",
+                        custom_domain_id=custom_domain.id,
+                    )
+                )
+
+            rule_order = rule.order
+            AutoCreateRule.delete(rule_id)
+            Session.commit()
+            flash(f"Rule #{rule_order} has been deleted", "success")
+            return redirect(
+                url_for(
+                    "dashboard.domain_detail_auto_create",
+                    custom_domain_id=custom_domain.id,
+                )
+            )
+        elif request.form.get("form-name") == "test-auto-create-rule":
+            if auto_create_test_form.validate():
+                local = auto_create_test_form.local.data
+                auto_create_test_local = local
+
+                for rule in custom_domain.auto_create_rules:
+                    if regex_match(rule.regex, local):
+                        auto_create_test_result = (
+                            f"{local}@{custom_domain.domain} passes rule #{rule.order}"
+                        )
+                        auto_create_test_passed = True
+                        break
+                else:  # no rule passes
+                    auto_create_test_result = (
+                        f"{local}@{custom_domain.domain} doesn't pass any rule"
+                    )
+
+                return render_template(
+                    "dashboard/domain_detail/auto-create.html", **locals()
+                )
+
+    return render_template("dashboard/domain_detail/auto-create.html", **locals())
