@@ -632,26 +632,6 @@ def personal_email_already_used(email_address: str) -> bool:
 
 
 
-def get_mailbox_bounce_info(bounce_report: Message) -> Optional[Message]:
-    i = 0
-    for part in bounce_report.walk():
-        i += 1
-
-
-        if i == 5:
-            if not part["content-transfer-encoding"]:
-                LOG.w("add missing content-transfer-encoding header")
-                part["content-transfer-encoding"] = "7bit"
-
-            try:
-                part.as_bytes().decode()
-            except UnicodeDecodeError:
-                LOG.w("cannot use this bounce report")
-                return
-            else:
-                return part
-
-
 def get_header_from_bounce(msg: Message, header: str) -> str:
     """using regex to get header value from bounce message
     get_orig_message_from_bounce is better. This should be the last option
@@ -844,3 +824,221 @@ def decode_text(text: str, encoding: EmailEncoding = EmailEncoding.NO) -> str:
         return decoded.decode(errors="ignore")
     else:  # 7bit - no encoding
         return text
+
+def add_header(
+    msg: Message, text_header, html_header=None, subject_prefix=None
+) -> Message:
+    if not html_header:
+        html_header = text_header.replace("\n", "<br>")
+
+    if subject_prefix is not None:
+        subject = msg[headers.SUBJECT]
+        if not subject:
+            msg.add_header(headers.SUBJECT, subject_prefix)
+        else:
+            subject = f"{subject_prefix} {subject}"
+            msg.replace_header(headers.SUBJECT, subject)
+
+    content_type = msg.get_content_type().lower()
+    if content_type == "text/plain":
+        encoding = get_encoding(msg)
+        payload = msg.get_payload()
+        if isinstance(payload, str):
+            clone_msg = copy(msg)
+            new_payload = f"""{text_header}
+------------------------------
+{decode_text(payload, encoding)}"""
+            clone_msg.set_payload(encode_text(new_payload, encoding))
+            return clone_msg
+    elif content_type == "text/html":
+        encoding = get_encoding(msg)
+        payload = msg.get_payload()
+        if isinstance(payload, str):
+            new_payload = f"""<table width="100%" style="width: 100%; -premailer-width: 100%; -premailer-cellpadding: 0;
+  -premailer-cellspacing: 0; margin: 0; padding: 0;">
+    <tr>
+        <td style="border-bottom:1px dashed #5675E2; padding: 10px 0px">{html_header}</td>
+    </tr>
+    <tr>
+        <td>
+        {decode_text(payload, encoding)}
+        </td>
+    </tr>
+</table>
+"""
+
+            clone_msg = copy(msg)
+            clone_msg.set_payload(encode_text(new_payload, encoding))
+            return clone_msg
+    elif content_type in ("multipart/alternative", "multipart/related"):
+        new_parts = []
+        for part in msg.get_payload():
+            if isinstance(part, Message):
+                new_parts.append(add_header(part, text_header, html_header))
+            elif isinstance(part, str):
+                new_parts.append(MIMEText(part))
+            else:
+                new_parts.append(part)
+        clone_msg = copy(msg)
+        clone_msg.set_payload(new_parts)
+        return clone_msg
+
+    elif content_type in ("multipart/mixed", "multipart/signed"):
+        new_parts = []
+        payload = msg.get_payload()
+        if isinstance(payload, str):
+            # The message is badly formatted inject as new
+            new_parts = [MIMEText(text_header, "plain"), MIMEText(payload, "plain")]
+            clone_msg = copy(msg)
+            clone_msg.set_payload(new_parts)
+            return clone_msg
+        parts = list(payload)
+        LOG.d("only add header for the first part for %s", content_type)
+        for ix, part in enumerate(parts):
+            if ix == 0:
+                new_parts.append(add_header(part, text_header, html_header))
+            else:
+                new_parts.append(part)
+
+        clone_msg = copy(msg)
+        clone_msg.set_payload(new_parts)
+        return clone_msg
+
+    LOG.d("No header added for %s", content_type)
+    return msg
+
+
+def replace(msg: Union[Message, str], old, new) -> Union[Message, str]:
+    if isinstance(msg, str):
+        msg = msg.replace(old, new)
+        return msg
+
+    content_type = msg.get_content_type()
+
+    if (
+        content_type.startswith("image/")
+        or content_type.startswith("video/")
+        or content_type.startswith("audio/")
+        or content_type == "multipart/signed"
+        or content_type.startswith("application/")
+        or content_type == "text/calendar"
+        or content_type == "text/directory"
+        or content_type == "text/csv"
+        or content_type == "text/x-python-script"
+    ):
+        LOG.d("not applicable for %s", content_type)
+        return msg
+
+    if content_type in ("text/plain", "text/html"):
+        encoding = get_encoding(msg)
+        payload = msg.get_payload()
+        if isinstance(payload, str):
+            if encoding == EmailEncoding.QUOTED:
+                LOG.d("handle quoted-printable replace %s -> %s", old, new)
+                # first decode the payload
+                try:
+                    new_payload = quopri.decodestring(payload).decode("utf-8")
+                except UnicodeDecodeError:
+                    LOG.w("cannot decode payload:%s", payload)
+                    return msg
+                # then replace the old text
+                new_payload = new_payload.replace(old, new)
+                clone_msg = copy(msg)
+                clone_msg.set_payload(quopri.encodestring(new_payload.encode()))
+                return clone_msg
+            elif encoding == EmailEncoding.BASE64:
+                new_payload = decode_text(payload, encoding).replace(old, new)
+                new_payload = base64.b64encode(new_payload.encode("utf-8"))
+                clone_msg = copy(msg)
+                clone_msg.set_payload(new_payload)
+                return clone_msg
+            else:
+                clone_msg = copy(msg)
+                new_payload = payload.replace(
+                    encode_text(old, encoding), encode_text(new, encoding)
+                )
+                clone_msg.set_payload(new_payload)
+                return clone_msg
+
+    elif content_type in (
+        "multipart/alternative",
+        "multipart/related",
+        "multipart/mixed",
+        "message/rfc822",
+    ):
+        new_parts = []
+        for part in msg.get_payload():
+            new_parts.append(replace(part, old, new))
+        clone_msg = copy(msg)
+        clone_msg.set_payload(new_parts)
+        return clone_msg
+
+    LOG.w("Cannot replace text for %s", msg.get_content_type())
+    return msg
+
+
+def generate_reply_email(contact_email: str, alias: Alias) -> str:
+
+    include_sender_in_reverse_alias = False
+
+    user = alias.user
+    # user has set this option explicitly
+    if user.include_sender_in_reverse_alias is not None:
+        include_sender_in_reverse_alias = user.include_sender_in_reverse_alias
+
+    if include_sender_in_reverse_alias and contact_email:
+        # make sure contact_email can be ascii-encoded
+        contact_email = convert_to_id(contact_email)
+        contact_email = sanitize_email(contact_email)
+        contact_email = contact_email[:45]
+        contact_email = contact_email.replace("@", "_at_")
+        contact_email = contact_email.replace(".", "_")
+        contact_email = convert_to_alphanumeric(contact_email)
+
+    reply_domain = config.EMAIL_DOMAIN
+    alias_domain = get_email_domain_part(alias.email)
+    sl_domain = SLDomain.get_by(domain=alias_domain)
+    if sl_domain and sl_domain.use_as_reverse_alias:
+        reply_domain = alias_domain
+
+    # not use while to avoid infinite loop
+    for _ in range(1000):
+        if include_sender_in_reverse_alias and contact_email:
+            random_length = random.randint(5, 10)
+            reply_email = (
+                # do not use the ra+ anymore
+                # f"ra+{contact_email}+{random_string(random_length)}@{config.EMAIL_DOMAIN}"
+                f"{contact_email}_{random_string(random_length)}@{reply_domain}"
+            )
+        else:
+            random_length = random.randint(20, 50)
+            # do not use the ra+ anymore
+            # reply_email = f"ra+{random_string(random_length)}@{config.EMAIL_DOMAIN}"
+            reply_email = f"{random_string(random_length)}@{reply_domain}"
+
+        if available_sl_email(reply_email):
+            return reply_email
+
+    raise Exception("Cannot generate reply email")
+
+
+def is_reverse_alias(address: str) -> bool:
+    # to take into account the new reverse-alias that doesn't start with "ra+"
+    if Contact.get_by(reply_email=address):
+        return True
+
+    return address.endswith(f"@{config.EMAIL_DOMAIN}") and (
+        address.startswith("reply+") or address.startswith("ra+")
+    )
+
+def should_disable(alias: Alias) -> (bool, str):
+    """
+    Return whether an alias should be disabled and if yes, the reason why
+    """
+    # Bypass the bounce rule
+    if alias.cannot_be_disabled:
+        LOG.w("%s cannot be disabled", alias)
+        return False, ""
+
+    if not config.ALIAS_AUTOMATIC_DISABLE:
+        return False, ""
