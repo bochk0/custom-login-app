@@ -131,25 +131,7 @@ def mailbox_route():
                     flash(f"{mailbox_email} already used", "error")
                 elif not email_can_be_used_as_mailbox(mailbox_email):
                     flash(f"You cannot use {mailbox_email}.", "error")
-                else:
-                    new_mailbox = Mailbox.create(
-                        email=mailbox_email, user_id=current_user.id
-                    )
-                    Session.commit()
 
-                    send_verification_email(current_user, new_mailbox)
-
-                    flash(
-                        f"You are going to receive an email to confirm {mailbox_email}.",
-                        "success",
-                    )
-
-                    return redirect(
-                        url_for(
-                            "dashboard.mailbox_detail_route",
-                            mailbox_id=new_mailbox.id,
-                        )
-                    )
 
     return render_template(
         "dashboard/mailbox.html",
