@@ -257,13 +257,7 @@ def send_cannot_create_domain_alias(user, alias, domain):
             user=user,
             alias=alias,
             domain=domain,
-        ),
-        render(
-            "transactional/cannot-create-alias-domain.html",
-            user=user,
-            alias=alias,
-            domain=domain,
-        ),
+        )
     )
 
 
@@ -306,15 +300,6 @@ def send_email(
     date_header = formatdate()
     msg[headers.DATE] = date_header
 
-    if headers.MIME_VERSION not in msg:
-        msg[headers.MIME_VERSION] = "1.0"
-
-    if unsubscribe_link:
-        add_or_replace_header(msg, headers.LIST_UNSUBSCRIBE, f"<{unsubscribe_link}>")
-        if not unsubscribe_via_email:
-            add_or_replace_header(
-                msg, headers.LIST_UNSUBSCRIBE_POST, "List-Unsubscribe=One-Click"
-            )
 
     # add DKIM
     email_domain = from_addr[from_addr.find("@") + 1 :]
@@ -459,3 +444,219 @@ def add_dkim_signature(msg: Message, email_domain: str):
         LOG.w("email saved to %s", file_name)
 
     raise Exception("Cannot create DKIM signature")
+
+    def add_dkim_signature_with_header(
+    msg: Message, email_domain: str, dkim_headers: [bytes]
+):
+    delete_header(msg, "DKIM-Signature")
+
+    # Specify headers in "byte" form
+    # Generate message signature
+    if config.DKIM_PRIVATE_KEY:
+        sig = dkim.sign(
+            message_to_bytes(msg),
+            config.DKIM_SELECTOR,
+            email_domain.encode(),
+            config.DKIM_PRIVATE_KEY.encode(),
+            include_headers=dkim_headers,
+        )
+        sig = sig.decode()
+
+        # remove linebreaks from sig
+        sig = sig.replace("\n", " ").replace("\r", "")
+        msg[headers.DKIM_SIGNATURE] = sig[len("DKIM-Signature: ") :]
+
+
+def add_or_replace_header(msg: Message, header: str, value: str):
+    """
+    Remove all occurrences of `header` and add `header` with `value`.
+    """
+    delete_header(msg, header)
+    msg[header] = value
+
+
+def delete_header(msg: Message, header: str):
+    """a header can appear several times in message."""
+    # inspired from https://stackoverflow.com/a/47903323/1428034
+    for i in reversed(range(len(msg._headers))):
+        header_name = msg._headers[i][0].lower()
+        if header_name == header.lower():
+            del msg._headers[i]
+
+
+def sanitize_header(msg: Message, header: str):
+    """remove trailing space and remove linebreak from a header"""
+    header_lowercase = header.lower()
+    for i in reversed(range(len(msg._headers))):
+        header_name = msg._headers[i][0].lower()
+        if header_name == header_lowercase:
+            # msg._headers[i] is a tuple like ('From', 'hey@google.com')
+            if msg._headers[i][1]:
+                msg._headers[i] = (
+                    msg._headers[i][0],
+                    msg._headers[i][1].strip().replace("\n", " "),
+                )
+
+
+def delete_all_headers_except(msg: Message, headers: [str]):
+    headers = [h.lower() for h in headers]
+
+    for i in reversed(range(len(msg._headers))):
+        header_name = msg._headers[i][0].lower()
+        if header_name not in headers:
+            del msg._headers[i]
+
+
+def can_create_directory_for_address(email_address: str) -> bool:
+    """return True if an email ends with one of the alias domains provided by Login"""
+    # not allow creating directory with premium domain
+    for domain in config.ALIAS_DOMAINS:
+        if email_address.endswith("@" + domain):
+            return True
+
+    return False
+
+
+def is_valid_alias_address_domain(email_address) -> bool:
+    """Return whether an address domain might a domain handled by Login"""
+    domain = get_email_domain_part(email_address)
+    if SLDomain.get_by(domain=domain):
+        return True
+
+    if CustomDomain.get_by(domain=domain, verified=True):
+        return True
+
+    return False
+
+
+def email_can_be_used_as_mailbox(email_address: str) -> bool:
+    """Return True if an email can be used as a personal email.
+    Use the email domain as criteria. A domain can be used if it is not:
+    - one of ALIAS_DOMAINS
+    - one of PREMIUM_ALIAS_DOMAINS
+    - one of custom domains
+    - a disposable domain
+    """
+    try:
+        domain = validate_email(
+            email_address, check_deliverability=False, allow_smtputf8=False
+        ).domain
+    except EmailNotValidError:
+        LOG.d("%s is invalid email address", email_address)
+        return False
+
+    if not domain:
+        LOG.d("no valid domain associated to %s", email_address)
+        return False
+
+    if SLDomain.get_by(domain=domain):
+        LOG.d("%s is a SL domain", email_address)
+        return False
+
+    from app.models import CustomDomain
+
+    if CustomDomain.get_by(domain=domain, verified=True):
+        LOG.d("domain %s is a Login custom domain", domain)
+        return False
+
+    if is_invalid_mailbox_domain(domain):
+        LOG.d("Domain %s is invalid mailbox domain", domain)
+        return False
+
+    # check if email MX domain is disposable
+    mx_domains = get_mx_domain_list(domain)
+
+    # if no MX record, email is not valid
+    if not config.SKIP_MX_LOOKUP_ON_CHECK and not mx_domains:
+        LOG.d("No MX record for domain %s", domain)
+        return False
+
+    for mx_domain in mx_domains:
+        if is_invalid_mailbox_domain(mx_domain):
+            LOG.d("MX Domain %s %s is invalid mailbox domain", mx_domain, domain)
+            return False
+
+    existing_user = User.get_by(email=email_address)
+    if existing_user and existing_user.disabled:
+        LOG.d(
+            f"User {existing_user} is disabled. {email_address} cannot be used for other mailbox"
+        )
+        return False
+
+    for existing_user in (
+        User.query()
+        .join(Mailbox, User.id == Mailbox.user_id)
+        .filter(Mailbox.email == email_address)
+        .group_by(User.id)
+        .all()
+    ):
+        if existing_user.disabled:
+            LOG.d(
+                f"User {existing_user} is disabled and has a mailbox with {email_address}. Id cannot be used for other mailbox"
+            )
+            return False
+
+    return True
+
+
+def is_invalid_mailbox_domain(domain):
+    """
+    Whether a domain is invalid mailbox domain
+    Also return True if `domain` is a subdomain of an invalid mailbox domain
+    """
+    parts = domain.split(".")
+    for i in range(0, len(parts) - 1):
+        parent_domain = ".".join(parts[i:])
+
+        if InvalidMailboxDomain.get_by(domain=parent_domain):
+            return True
+
+    return False
+
+
+def get_mx_domain_list(domain) -> [str]:
+    """return list of MX domains for a given email.
+    domain name ends *without* a dot (".") at the end.
+    """
+    priority_domains = get_mx_domains(domain)
+
+    return [d[:-1] for _, d in priority_domains]
+
+
+def personal_email_already_used(email_address: str) -> bool:
+    """test if an email can be used as user email"""
+    if User.get_by(email=email_address):
+        return True
+
+    return False
+
+
+def mailbox_already_used(email: str, user) -> bool:
+    if Mailbox.get_by(email=email, user_id=user.id):
+        return True
+
+    # support the case user wants to re-add their real email as mailbox
+    # can happen when user changes their root email and wants to add this new email as mailbox
+    if email == user.email:
+        return False
+
+    return False
+
+
+def get_orig_message_from_bounce(bounce_report: Message) -> Optional[Message]:
+    """parse the original email from Bounce"""
+    i = 0
+    for part in bounce_report.walk():
+        i += 1
+
+        # 1st part is the container (bounce report)
+        # 2nd part is the report from our own Postfix
+        # 3rd is report from other mailbox
+        # 4th is the container of the original message
+        # ...
+        # 7th is original message
+        if i == 7:
+            return part
+
+
+def get_mailbox_bounce_info(bounce_report: Message) -> Optional[Message]:
