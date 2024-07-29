@@ -631,32 +631,216 @@ def personal_email_already_used(email_address: str) -> bool:
     return False
 
 
-def mailbox_already_used(email: str, user) -> bool:
-    if Mailbox.get_by(email=email, user_id=user.id):
-        return True
 
-    # support the case user wants to re-add their real email as mailbox
-    # can happen when user changes their root email and wants to add this new email as mailbox
-    if email == user.email:
-        return False
-
-    return False
-
-
-def get_orig_message_from_bounce(bounce_report: Message) -> Optional[Message]:
-    """parse the original email from Bounce"""
+def get_mailbox_bounce_info(bounce_report: Message) -> Optional[Message]:
     i = 0
     for part in bounce_report.walk():
         i += 1
 
-        # 1st part is the container (bounce report)
-        # 2nd part is the report from our own Postfix
-        # 3rd is report from other mailbox
-        # 4th is the container of the original message
-        # ...
-        # 7th is original message
-        if i == 7:
+
+        if i == 5:
+            if not part["content-transfer-encoding"]:
+                LOG.w("add missing content-transfer-encoding header")
+                part["content-transfer-encoding"] = "7bit"
+
+            try:
+                part.as_bytes().decode()
+            except UnicodeDecodeError:
+                LOG.w("cannot use this bounce report")
+                return
+            else:
+                return part
+
+
+def get_header_from_bounce(msg: Message, header: str) -> str:
+    """using regex to get header value from bounce message
+    get_orig_message_from_bounce is better. This should be the last option
+    """
+    msg_str = str(msg)
+    exp = re.compile(f"{header}.*\n")
+    r = re.search(exp, msg_str)
+    if r:
+        # substr should be something like 'HEADER: 1234'
+        substr = msg_str[r.start() : r.end()].strip()
+        parts = substr.split(":")
+        return parts[1].strip()
+
+    return None
+
+
+def get_orig_message_from_spamassassin_report(msg: Message) -> Message:
+
+    i = 0
+    for part in msg.walk():
+        i += 1
+
+        if i == 4:
             return part
 
 
-def get_mailbox_bounce_info(bounce_report: Message) -> Optional[Message]:
+def get_spam_info(msg: Message, max_score=None) -> (bool, str):
+
+    spamassassin_status = msg[headers.X_SPAM_STATUS]
+    if not spamassassin_status:
+        return False, ""
+
+    return get_spam_from_header(spamassassin_status, max_score=max_score)
+
+
+def get_spam_from_header(spam_status_header, max_score=None) -> (bool, str):
+
+    # yes or no
+    spamassassin_answer = spam_status_header[: spam_status_header.find(",")]
+
+    if max_score:
+        # spam score
+        # get the score section "score=-0.1"
+        score_section = (
+            spam_status_header[spam_status_header.find(",") + 1 :].strip().split(" ")[0]
+        )
+        score = float(score_section[len("score=") :])
+        if score >= max_score:
+            LOG.w("Spam score %s exceeds %s", score, max_score)
+            return True, spam_status_header
+
+    return spamassassin_answer.lower() == "yes", spam_status_header
+
+
+def get_header_unicode(header: Union[str, Header]) -> str:
+    """
+    Convert a header to unicode
+    Should be used to handle headers like From:, To:, CC:, Subject:
+    """
+    if header is None:
+        return ""
+
+    ret = ""
+    for to_decoded_str, charset in decode_header(header):
+        if charset is None:
+            if isinstance(to_decoded_str, bytes):
+                decoded_str = to_decoded_str.decode()
+            else:
+                decoded_str = to_decoded_str
+        else:
+            try:
+                decoded_str = to_decoded_str.decode(charset)
+            except (LookupError, UnicodeDecodeError):  # charset is unknown
+                LOG.w("Cannot decode %s with %s, try utf-8", to_decoded_str, charset)
+                try:
+                    decoded_str = to_decoded_str.decode("utf-8")
+                except UnicodeDecodeError:
+                    LOG.w("Cannot UTF-8 decode %s", to_decoded_str)
+                    decoded_str = to_decoded_str.decode("utf-8", errors="replace")
+        ret += decoded_str
+
+    return ret
+
+
+def copy(msg: Message) -> Message:
+    """return a copy of message"""
+    try:
+        return deepcopy(msg)
+    except Exception:
+        LOG.w("deepcopy fails, try string parsing")
+        try:
+            return message_from_string(msg.as_string())
+        except (UnicodeEncodeError, LookupError):
+            LOG.w("as_string() fails, try bytes parsing")
+            return message_from_bytes(message_to_bytes(msg))
+
+
+def to_bytes(msg: Message):
+    """replace Message.as_bytes() method by trying different policies"""
+    for generator_policy in [None, policy.SMTP, policy.SMTPUTF8]:
+        try:
+            return msg.as_bytes(policy=generator_policy)
+        except Exception:
+            LOG.w("as_bytes() fails with %s policy", policy, exc_info=True)
+
+    msg_string = msg.as_string()
+    try:
+        return msg_string.encode()
+    except Exception:
+        LOG.w("as_string().encode() fails", exc_info=True)
+
+    return msg_string.encode(errors="replace")
+
+
+def should_add_dkim_signature(domain: str) -> bool:
+    if SLDomain.get_by(domain=domain):
+        return True
+
+    custom_domain: CustomDomain = CustomDomain.get_by(domain=domain)
+    if custom_domain.dkim_verified:
+        return True
+
+    return False
+
+
+class EmailEncoding(enum.Enum):
+    BASE64 = "base64"
+    QUOTED = "quoted-printable"
+    NO = "no-encoding"
+
+
+def get_encoding(msg: Message) -> EmailEncoding:
+    """
+    Return the message encoding, possible values:
+    - quoted-printable
+    - base64
+    - 7bit: default if unknown or empty
+    """
+    cte = (
+        str(msg.get(headers.CONTENT_TRANSFER_ENCODING, ""))
+        .lower()
+        .strip()
+        .strip('"')
+        .strip("'")
+    )
+    if cte in (
+        "",
+        "7bit",
+        "7-bit",
+        "7bits",
+        "8bit",
+        "8bits",
+        "binary",
+        "8bit;",
+        "utf-8",
+    ):
+        return EmailEncoding.NO
+
+    if cte == "base64":
+        return EmailEncoding.BASE64
+
+    if cte == "quoted-printable":
+        return EmailEncoding.QUOTED
+
+    # some email services use unknown encoding
+    if cte in ("amazonses.com",):
+        return EmailEncoding.NO
+
+    LOG.e("Unknown encoding %s", cte)
+
+    return EmailEncoding.NO
+
+
+def encode_text(text: str, encoding: EmailEncoding = EmailEncoding.NO) -> str:
+    if encoding == EmailEncoding.QUOTED:
+        encoded = quopri.encodestring(text.encode("utf-8"))
+        return str(encoded, "utf-8")
+    elif encoding == EmailEncoding.BASE64:
+        encoded = base64.b64encode(text.encode("utf-8"))
+        return str(encoded, "utf-8")
+    else:  # 7bit - no encoding
+        return text
+
+def decode_text(text: str, encoding: EmailEncoding = EmailEncoding.NO) -> str:
+    if encoding == EmailEncoding.QUOTED:
+        decoded = quopri.decodestring(text.encode("utf-8"))
+        return decoded.decode(errors="ignore")
+    elif encoding == EmailEncoding.BASE64:
+        decoded = base64.b64decode(text.encode("utf-8"))
+        return decoded.decode(errors="ignore")
+    else:  # 7bit - no encoding
+        return text
