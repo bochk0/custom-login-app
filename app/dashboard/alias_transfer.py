@@ -64,22 +64,7 @@ def alias_transfer_send_route(alias_id):
                 + f"?token={transfer_token}"
             )
             flash("Share alias URL created", "success")
-        # request.form.get("form-name") == "remove"
-        else:
-            alias.transfer_token = None
-            alias.transfer_token_expiration = None
-            Session.commit()
-            alias_transfer_url = None
-            flash("Share URL deleted", "success")
 
-    return render_template(
-        "dashboard/alias_transfer_send.html",
-        alias=alias,
-        alias_transfer_url=alias_transfer_url,
-        link_active=alias.transfer_token_expiration is not None
-        and alias.transfer_token_expiration > arrow.utcnow(),
-        csrf_form=csrf_form,
-    )
 
 
 @dashboard_bp.route("/alias_transfer/receive", methods=["GET", "POST"])
