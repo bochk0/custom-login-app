@@ -163,23 +163,6 @@ def get_contact_infos(
         )
     )
 
-    if query:
-        q = q.filter(
-            or_(
-                Contact.website_email.ilike(f"%{query}%"),
-                Contact.name.ilike(f"%{query}%"),
-            )
-        )
-
-
-    for contact, latest_email_log, nb_reply, nb_forward in q:
-        contact_info = ContactInfo(
-            contact=contact,
-            nb_forward=nb_forward,
-            nb_reply=nb_reply,
-            latest_email_log=latest_email_log,
-        )
-        ret.append(contact_info)
 
     return ret
 
