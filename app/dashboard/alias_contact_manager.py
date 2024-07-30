@@ -171,23 +171,7 @@ def get_contact_infos(
             )
         )
 
-    if contact_id:
-        q = q.filter(Contact.id == contact_id)
 
-    latest_activity = case(
-        [
-            (EmailLog.created_at > Contact.created_at, EmailLog.created_at),
-            (EmailLog.created_at < Contact.created_at, Contact.created_at),
-        ],
-        else_=Contact.created_at,
-    )
-    q = (
-        q.order_by(latest_activity.desc())
-        .limit(config.PAGE_LIMIT)
-        .offset(page * config.PAGE_LIMIT)
-    )
-
-    ret = []
     for contact, latest_email_log, nb_reply, nb_forward in q:
         contact_info = ContactInfo(
             contact=contact,
@@ -214,3 +198,105 @@ def delete_contact(alias: Alias, contact_id: int):
 
         flash(f"Reverse-alias for {delete_contact_email} has been deleted", "success")
 
+
+@dashboard_bp.route("/alias_contact_manager/<int:alias_id>/", methods=["GET", "POST"])
+@login_required
+@parallel_limiter.lock(name="contact_creation")
+def alias_contact_manager(alias_id):
+    highlight_contact_id = None
+    if request.args.get("highlight_contact_id"):
+        try:
+            highlight_contact_id = int(request.args.get("highlight_contact_id"))
+        except ValueError:
+            flash("Invalid contact id", "error")
+            return redirect(url_for("dashboard.index"))
+
+    alias = Alias.get(alias_id)
+
+    page = 0
+    if request.args.get("page"):
+        page = int(request.args.get("page"))
+
+    query = request.args.get("query") or ""
+
+    # sanity check
+    if not alias:
+        flash("You do not have access to this page", "warning")
+        return redirect(url_for("dashboard.index"))
+
+    if alias.user_id != current_user.id:
+        flash("You do not have access to this page", "warning")
+        return redirect(url_for("dashboard.index"))
+
+    new_contact_form = NewContactForm()
+    csrf_form = CSRFValidationForm()
+
+    if request.method == "POST":
+        if not csrf_form.validate():
+            flash("Invalid request", "warning")
+            return redirect(request.url)
+        if request.form.get("form-name") == "create":
+            if new_contact_form.validate():
+                contact_address = new_contact_form.email.data.strip()
+                try:
+                    contact = create_contact(current_user, alias, contact_address)
+                except (
+                    ErrContactErrorUpgradeNeeded,
+                    ErrAddressInvalid,
+                    ErrContactAlreadyExists,
+                    CannotCreateContactForReverseAlias,
+                ) as excp:
+                    flash(excp.error_for_user(), "error")
+                    return redirect(request.url)
+                flash(f"Reverse alias for {contact_address} is created", "success")
+                return redirect(
+                    url_for(
+                        "dashboard.alias_contact_manager",
+                        alias_id=alias_id,
+                        highlight_contact_id=contact.id,
+                    )
+                )
+        elif request.form.get("form-name") == "delete":
+            contact_id = request.form.get("contact-id")
+            delete_contact(alias, contact_id)
+            return redirect(
+                url_for("dashboard.alias_contact_manager", alias_id=alias_id)
+            )
+
+        elif request.form.get("form-name") == "search":
+            query = request.form.get("query")
+            return redirect(
+                url_for(
+                    "dashboard.alias_contact_manager",
+                    alias_id=alias_id,
+                    query=query,
+                    highlight_contact_id=highlight_contact_id,
+                )
+            )
+
+    contact_infos = get_contact_infos(alias, page, query=query)
+    last_page = len(contact_infos) < config.PAGE_LIMIT
+    nb_contact = Contact.filter(Contact.alias_id == alias.id).count()
+
+    # if highlighted contact isn't included, fetch it
+    # make sure highlighted contact is at array start
+    contact_ids = [contact_info.contact.id for contact_info in contact_infos]
+    if highlight_contact_id and highlight_contact_id not in contact_ids:
+        contact_infos = (
+            get_contact_infos(alias, contact_id=highlight_contact_id, query=query)
+            + contact_infos
+        )
+
+    return render_template(
+        "dashboard/alias_contact_manager.html",
+        contact_infos=contact_infos,
+        alias=alias,
+        new_contact_form=new_contact_form,
+        highlight_contact_id=highlight_contact_id,
+        page=page,
+        last_page=last_page,
+        query=query,
+        nb_contact=nb_contact,
+        can_create_contacts=current_user.can_create_contacts(),
+        csrf_form=csrf_form,
+    )
