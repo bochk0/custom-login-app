@@ -50,17 +50,6 @@ def batch_import_route():
                 csrf_form=csrf_form,
             )
 
-        alias_file = request.files["alias-file"]
-
-        file_path = random_string(20) + ".csv"
-        file = File.create(user_id=current_user.id, path=file_path)
-        s3.upload_from_bytesio(file_path, alias_file)
-        Session.flush()
-        LOG.d("upload file %s to s3 at %s", file, file_path)
-
-        bi = BatchImport.create(user_id=current_user.id, file_id=file.id)
-        Session.flush()
-        LOG.d("Add a batch import job %s for %s", bi, current_user)
 
         # Schedule batch import job
         Job.create(
