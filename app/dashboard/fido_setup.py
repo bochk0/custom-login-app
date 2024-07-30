@@ -83,27 +83,6 @@ def fido_setup():
             "dashboard/recovery_code.html", recovery_codes=recovery_codes
         )
 
-    # Prepare information for key registration process
-    fido_uuid = (
-        str(uuid.uuid4()) if current_user.fido_uuid is None else current_user.fido_uuid
-    )
-    challenge = secrets.token_urlsafe(32)
-
-    credential_create_options = webauthn.WebAuthnMakeCredentialOptions(
-        challenge,
-        "Login",
-        RP_ID,
-        fido_uuid,
-        current_user.email,
-        current_user.name if current_user.name else current_user.email,
-        False,
-        attestation="none",
-        user_verification="discouraged",
-    )
-
-
-    registration_dict = credential_create_options.registration_dict
-    del registration_dict["extensions"]["webauthn.loc"]
 
     # Prevent user from adding duplicated keys
     for fido in fidos:
