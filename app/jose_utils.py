@@ -33,23 +33,6 @@ def make_id_token(
         "auth_time": arrow.now().timestamp,
     }
 
-    if nonce:
-        claims["nonce"] = nonce
-
-    if access_token:
-        claims["at_hash"] = id_token_hash(access_token)
-
-    if code:
-        claims["c_hash"] = id_token_hash(code)
-
-    claims = {**claims, **client_user.get_user_info()}
-
-    jwt_token = jwt.JWT(
-        header={"alg": "RS256", "kid": _key._public_params()["kid"]}, claims=claims
-    )
-    jwt_token.make_signed_token(_key)
-    return jwt_token.serialize()
-
 
 def verify_id_token(id_token) -> bool:
     try:
