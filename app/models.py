@@ -205,20 +205,6 @@ class BlockBehaviourEnum(EnumE):
     return_5xx = 1
 
 
-class AuditLogActionEnum(EnumE):
-    create_object = 0
-    update_object = 1
-    delete_object = 2
-    manual_upgrade = 3
-    extend_trial = 4
-    disable_2fa = 5
-    logged_as_user = 6
-    extend_subscription = 7
-    download_provider_complaint = 8
-    disable_user = 9
-    enable_user = 10
-    stop_trial = 11
-
 
 class Phase(EnumE):
     unknown = 0
@@ -243,3 +229,231 @@ class UnsubscribeBehaviourEnum(EnumE):
     DisableAlias = 0
     BlockContact = 1
     PreserveOriginal = 2
+
+
+    class AliasDeleteReason(EnumE):
+    Unspecified = 0
+    UserHasBeenDeleted = 1
+    ManualAction = 2
+    DirectoryDeleted = 3
+    MailboxDeleted = 4
+    CustomDomainDeleted = 5
+
+
+class IntEnumType(sa.types.TypeDecorator):
+    impl = sa.Integer
+
+    def __init__(self, enumtype, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._enum_type = enumtype
+
+    def process_bind_param(self, enum_obj, dialect):
+        return enum_obj.value
+
+    def process_result_value(self, enum_value, dialect):
+        return self._enum_type(enum_value)
+
+
+@dataclasses.dataclass
+class AliasOptions:
+    show_sl_domains: bool = True
+    show_partner_domains: Optional[Partner] = None
+    show_partner_premium: Optional[bool] = None
+
+
+class Hibp(Base, ModelMixin):
+    __tablename__ = "hibp"
+    name = sa.Column(sa.String(), nullable=False, unique=True, index=True)
+    breached_aliases = orm.relationship("Alias", secondary="alias_hibp")
+
+    description = sa.Column(sa.Text)
+    date = sa.Column(ArrowType, nullable=True)
+
+    def __repr__(self):
+        return f"<HIBP Breach {self.id} {self.name}>"
+
+
+class HibpNotifiedAlias(Base, ModelMixin):
+
+    __tablename__ = "hibp_notified_alias"
+    alias_id = sa.Column(
+        sa.ForeignKey("alias.id", ondelete="cascade"), nullable=False, index=True
+    )
+    user_id = sa.Column(sa.ForeignKey("users.id", ondelete="cascade"), nullable=False)
+
+    notified_at = sa.Column(ArrowType, default=arrow.utcnow, nullable=False)
+
+
+class Fido(Base, ModelMixin):
+    __tablename__ = "fido"
+    credential_id = sa.Column(sa.String(), nullable=False, unique=True, index=True)
+    uuid = sa.Column(
+        sa.ForeignKey("users.fido_uuid", ondelete="cascade"),
+        unique=False,
+        nullable=False,
+    )
+    public_key = sa.Column(sa.String(), nullable=False, unique=True)
+    sign_count = sa.Column(sa.BigInteger(), nullable=False)
+    name = sa.Column(sa.String(128), nullable=False, unique=False)
+    user_id = sa.Column(sa.ForeignKey("users.id", ondelete="cascade"), nullable=True)
+
+
+class User(Base, ModelMixin, UserMixin, PasswordOracle):
+    __tablename__ = "users"
+
+    FLAG_FREE_DISABLE_CREATE_ALIAS = 1 << 0
+    FLAG_CREATED_FROM_PARTNER = 1 << 1
+    FLAG_FREE_OLD_ALIAS_LIMIT = 1 << 2
+    FLAG_CREATED_ALIAS_FROM_PARTNER = 1 << 3
+
+    email = sa.Column(sa.String(256), unique=True, nullable=False)
+
+    name = sa.Column(sa.String(128), nullable=True)
+    is_admin = sa.Column(sa.Boolean, nullable=False, default=False)
+    alias_generator = sa.Column(
+        sa.Integer,
+        nullable=False,
+        default=AliasGeneratorEnum.word.value,
+        server_default=str(AliasGeneratorEnum.word.value),
+    )
+    notification = sa.Column(
+        sa.Boolean, default=True, nullable=False, server_default="1"
+    )
+
+    activated = sa.Column(sa.Boolean, default=False, nullable=False, index=True)
+
+    
+    disabled = sa.Column(sa.Boolean, default=False, nullable=False, server_default="0")
+
+    profile_picture_id = sa.Column(sa.ForeignKey(File.id), nullable=True)
+
+    otp_secret = sa.Column(sa.String(16), nullable=True)
+    enable_otp = sa.Column(
+        sa.Boolean, nullable=False, default=False, server_default="0"
+    )
+    last_otp = sa.Column(sa.String(12), nullable=True, default=False)
+
+    
+    fido_uuid = sa.Column(sa.String(), nullable=True, unique=True)
+
+    
+    
+    default_alias_custom_domain_id = sa.Column(
+        sa.ForeignKey("custom_domain.id", ondelete="SET NULL"),
+        nullable=True,
+        default=None,
+    )
+
+    default_alias_public_domain_id = sa.Column(
+        sa.ForeignKey("public_domain.id", ondelete="SET NULL"),
+        nullable=True,
+        default=None,
+    )
+
+    
+    lifetime = sa.Column(sa.Boolean, default=False, nullable=False, server_default="0")
+    paid_lifetime = sa.Column(
+        sa.Boolean, default=False, nullable=False, server_default="0"
+    )
+    lifetime_coupon_id = sa.Column(
+        sa.ForeignKey("lifetime_coupon.id", ondelete="SET NULL"),
+        nullable=True,
+        default=None,
+    )
+
+    
+    trial_end = sa.Column(
+        ArrowType, default=lambda: arrow.now().shift(days=7, hours=1), nullable=True
+    )
+
+    
+    
+    
+    
+    default_mailbox_id = sa.Column(
+        sa.ForeignKey("mailbox.id"), nullable=True, default=None
+    )
+
+    profile_picture = orm.relationship(File, foreign_keys=[profile_picture_id])
+
+    
+    
+    sender_format = sa.Column(
+        sa.Integer, default="0", nullable=False, server_default="0"
+    )
+    
+    
+    sender_format_updated_at = sa.Column(ArrowType, default=None)
+
+    replace_reverse_alias = sa.Column(
+        sa.Boolean, default=False, nullable=False, server_default="0"
+    )
+
+    referral_id = sa.Column(
+        sa.ForeignKey("referral.id", ondelete="SET NULL"),
+        nullable=True,
+        default=None,
+        index=True,
+    )
+
+    referral = orm.relationship("Referral", foreign_keys=[referral_id])
+
+    
+    intro_shown = sa.Column(
+        sa.Boolean, default=False, nullable=False, server_default="0"
+    )
+
+    default_mailbox = orm.relationship("Mailbox", foreign_keys=[default_mailbox_id])
+
+    
+    max_spam_score = sa.Column(sa.Integer, nullable=True)
+
+    
+    newsletter_alias_id = sa.Column(
+        sa.ForeignKey("alias.id", ondelete="SET NULL"),
+        nullable=True,
+        default=None,
+        index=True,
+    )
+
+    
+    include_sender_in_reverse_alias = sa.Column(
+        sa.Boolean, default=True, nullable=False, server_default="0"
+    )
+
+    
+    
+    
+    random_alias_suffix = sa.Column(
+        sa.Integer,
+        nullable=False,
+        default=AliasSuffixEnum.word.value,
+        server_default=str(AliasSuffixEnum.random_string.value),
+    )
+
+    
+    expand_alias_info = sa.Column(
+        sa.Boolean, default=False, nullable=False, server_default="0"
+    )
+
+    
+    
+    ignore_loop_email = sa.Column(
+        sa.Boolean, default=False, nullable=False, server_default="0"
+    )
+
+    
+    
+    alternative_id = sa.Column(sa.String(128), unique=True, nullable=True)
+
+    
+    
+    disable_automatic_alias_note = sa.Column(
+        sa.Boolean, default=False, nullable=False, server_default="0"
+    )
+
+    
+    
+    one_click_unsubscribe_block_sender = sa.Column(
+        sa.Boolean, default=False, nullable=False, server_default="0"
+    )
