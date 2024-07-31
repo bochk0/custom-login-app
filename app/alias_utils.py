@@ -357,30 +357,6 @@ def check_alias_prefix(alias_prefix) -> bool:
     return True
 
 
-def alias_export_csv(user, csv_direct_export=False):
-
-    data = [["alias", "note", "enabled", "mailboxes"]]
-    for alias in Alias.filter_by(user_id=user.id).all():  
-        
-        
-        alias_mailboxes = alias.mailboxes
-        alias_mailboxes.insert(
-            0, alias_mailboxes.pop(alias_mailboxes.index(alias.mailbox))
-        )
-
-        mailboxes = " ".join([mailbox.email for mailbox in alias_mailboxes])
-        data.append([alias.email, alias.note, alias.enabled, mailboxes])
-
-    si = StringIO()
-    cw = csv.writer(si)
-    cw.writerows(data)
-    if csv_direct_export:
-        return si.getvalue()
-    output = make_response(si.getvalue())
-    output.headers["Content-Disposition"] = "attachment; filename=aliases.csv"
-    output.headers["Content-type"] = "text/csv"
-    return output
-
 
 def transfer_alias(alias, new_user, new_mailboxes: [Mailbox]):
     
