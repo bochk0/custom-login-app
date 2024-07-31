@@ -149,16 +149,6 @@ def fake_data():
             )
         Session.commit()
 
-        if i % 5 == 0:
-            if i % 2 == 0:
-                AliasMailbox.create(alias_id=a.id, mailbox_id=user.default_mailbox_id)
-            else:
-                AliasMailbox.create(alias_id=a.id, mailbox_id=m1.id)
-        Session.commit()
-
-        if i % 5 == 0:
-            a.enabled = False
-            Session.commit()
 
     custom_domain1 = CustomDomain.create(user_id=user.id, domain="ab.cd", verified=True)
     Session.commit()
