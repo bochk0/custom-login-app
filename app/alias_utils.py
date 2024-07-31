@@ -150,23 +150,6 @@ def check_if_alias_can_be_auto_created_for_a_directory(
     if not directory:
         return None
 
-    user: User = directory.user
-    if user.disabled:
-        LOG.i("Disabled %s can't create new alias with directory", user)
-        return None
-
-    if not user.can_create_new_alias():
-        LOG.d(f"{user} can't create new directory alias {address}")
-        if notify_user:
-            send_cannot_create_directory_alias(user, address, directory_name)
-        return None
-
-    if directory.disabled:
-        if notify_user:
-            send_cannot_create_directory_alias_disabled(user, address, directory_name)
-        return None
-
-    return directory
 
 
 def try_auto_create(address: str) -> Optional[Alias]:
@@ -220,4 +203,250 @@ try:
                 mailbox_id=mailboxes[i].id,
             )
 
+        Session.commit()
+        return alias
+    except AliasInTrashError:
+        LOG.w(
+            "Alias %s was deleted before, cannot auto-create using directory %s, user %s",
+            address,
+            directory.name,
+            directory.user,
+        )
+        return None
+    except IntegrityError:
+        LOG.w("Alias %s already exists", address)
+        Session.rollback()
+        alias = Alias.get_by(email=address)
+        return alias
+
+
+def try_auto_create_via_domain(address: str) -> Optional[Alias]:
+
+    can_create = check_if_alias_can_be_auto_created_for_custom_domain(address)
+    if not can_create:
+        return None
+    custom_domain, rule = can_create
+
+    if rule:
+        alias_note = f"Created by rule {rule.order} with regex {rule.regex}"
+        mailboxes = rule.mailboxes
+    else:
+        alias_note = "Created by catchall option"
+        mailboxes = custom_domain.mailboxes
+
+    
+    if not mailboxes:
+        LOG.d(
+            "use %s default mailbox for %s %s",
+            custom_domain.user,
+            address,
+            custom_domain,
+        )
+        mailboxes = [custom_domain.user.default_mailbox]
+
+    try:
+        LOG.d("create alias %s for domain %s", address, custom_domain)
+        alias = Alias.create(
+            email=address,
+            user_id=custom_domain.user_id,
+            custom_domain_id=custom_domain.id,
+            automatic_creation=True,
+            mailbox_id=mailboxes[0].id,
+        )
+        if not custom_domain.user.disable_automatic_alias_note:
+            alias.note = alias_note
+        Session.flush()
+        for i in range(1, len(mailboxes)):
+            AliasMailbox.create(
+                alias_id=alias.id,
+                mailbox_id=mailboxes[i].id,
+            )
+        Session.commit()
+        return alias
+    except AliasInTrashError:
+        LOG.w(
+            "Alias %s was deleted before, cannot auto-create using domain catch-all %s, user %s",
+            address,
+            custom_domain,
+            custom_domain.user,
+        )
+        return None
+    except IntegrityError:
+        LOG.w("Alias %s already exists", address)
+        Session.rollback()
+        alias = Alias.get_by(email=address)
+        return alias
+    except DataError:
+        LOG.w("Cannot create alias %s", address)
+        Session.rollback()
+        return None
+
+
+def delete_alias(
+    alias: Alias, user: User, reason: AliasDeleteReason = AliasDeleteReason.Unspecified
+):
+
+    LOG.i(f"User {user} has deleted alias {alias}")
+    
+    if alias.custom_domain_id:
+        if not DomainDeletedAlias.get_by(
+            email=alias.email, domain_id=alias.custom_domain_id
+        ):
+            domain_deleted_alias = DomainDeletedAlias(
+                user_id=user.id,
+                email=alias.email,
+                domain_id=alias.custom_domain_id,
+                reason=reason,
+            )
+            Session.add(domain_deleted_alias)
+            Session.commit()
+            LOG.i(
+                f"Moving {alias} to domain {alias.custom_domain_id} trash {domain_deleted_alias}"
+            )
+    else:
+        if not DeletedAlias.get_by(email=alias.email):
+            deleted_alias = DeletedAlias(email=alias.email, reason=reason)
+            Session.add(deleted_alias)
+            Session.commit()
+            LOG.i(f"Moving {alias} to global trash {deleted_alias}")
+
+    Alias.filter(Alias.id == alias.id).delete()
+    Session.commit()
+
+    EventDispatcher.send_event(
+        user, EventContent(alias_deleted=AliasDeleted(alias_id=alias.id))
+    )
+
+
+def aliases_for_mailbox(mailbox: Mailbox) -> [Alias]:
+
+    ret = set(Alias.filter(Alias.mailbox_id == mailbox.id).all())
+
+    for alias in (
+        Session.query(Alias)
+        .join(AliasMailbox, Alias.id == AliasMailbox.alias_id)
+        .filter(AliasMailbox.mailbox_id == mailbox.id)
+    ):
+        ret.add(alias)
+
+    return list(ret)
+
+
+def nb_email_log_for_mailbox(mailbox: Mailbox):
+    aliases = aliases_for_mailbox(mailbox)
+    alias_ids = [alias.id for alias in aliases]
+    return (
+        Session.query(EmailLog)
+        .join(Contact, EmailLog.contact_id == Contact.id)
+        .filter(Contact.alias_id.in_(alias_ids))
+        .count()
+    )
+
+
+
+_ALIAS_PREFIX_PATTERN = r"[0-9a-z-_.]{1,}"
+
+
+def check_alias_prefix(alias_prefix) -> bool:
+    if len(alias_prefix) > 40:
+        return False
+
+    if re.fullmatch(_ALIAS_PREFIX_PATTERN, alias_prefix) is None:
+        return False
+
+    return True
+
+
+def alias_export_csv(user, csv_direct_export=False):
+
+    data = [["alias", "note", "enabled", "mailboxes"]]
+    for alias in Alias.filter_by(user_id=user.id).all():  
+        
+        
+        alias_mailboxes = alias.mailboxes
+        alias_mailboxes.insert(
+            0, alias_mailboxes.pop(alias_mailboxes.index(alias.mailbox))
+        )
+
+        mailboxes = " ".join([mailbox.email for mailbox in alias_mailboxes])
+        data.append([alias.email, alias.note, alias.enabled, mailboxes])
+
+    si = StringIO()
+    cw = csv.writer(si)
+    cw.writerows(data)
+    if csv_direct_export:
+        return si.getvalue()
+    output = make_response(si.getvalue())
+    output.headers["Content-Disposition"] = "attachment; filename=aliases.csv"
+    output.headers["Content-type"] = "text/csv"
+    return output
+
+
+def transfer_alias(alias, new_user, new_mailboxes: [Mailbox]):
+    
+    if User.get_by(newsletter_alias_id=alias.id):
+        raise Exception("Cannot transfer alias that's used to receive newsletter")
+
+    
+    Session.query(Contact).filter(Contact.alias_id == alias.id).update(
+        {"user_id": new_user.id}
+    )
+
+    Session.query(AliasUsedOn).filter(AliasUsedOn.alias_id == alias.id).update(
+        {"user_id": new_user.id}
+    )
+
+    Session.query(ClientUser).filter(ClientUser.alias_id == alias.id).update(
+        {"user_id": new_user.id}
+    )
+
+    
+    Session.query(AliasMailbox).filter(AliasMailbox.alias_id == alias.id).delete()
+
+    
+    alias.mailbox_id = new_mailboxes.pop().id
+    for mb in new_mailboxes:
+        AliasMailbox.create(alias_id=alias.id, mailbox_id=mb.id)
+
+    
+    if not alias.original_owner_id:
+        alias.original_owner_id = alias.user_id
+
+    
+    old_user = alias.user
+    send_email(
+        old_user.email,
+        f"Alias {alias.email} has been received",
+        render(
+            "transactional/alias-transferred.txt",
+            user=old_user,
+            alias=alias,
+        ),
+        render(
+            "transactional/alias-transferred.html",
+            user=old_user,
+            alias=alias,
+        ),
+    )
+
+    
+    alias.user_id = new_user.id
+
+    
+    alias.disable_pgp = False
+    alias.pinned = False
+
+    Session.commit()
+
+
+def change_alias_status(alias: Alias, enabled: bool, commit: bool = False):
+    LOG.i(f"Changing alias {alias} enabled to {enabled}")
+    alias.enabled = enabled
+
+    event = AliasStatusChanged(
+        alias_id=alias.id, alias_email=alias.email, enabled=enabled
+    )
+    EventDispatcher.send_event(alias.user, EventContent(alias_status_change=event))
+
+    if commit:
         Session.commit()
