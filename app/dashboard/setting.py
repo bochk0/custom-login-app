@@ -57,32 +57,6 @@ class PromoCodeForm(FlaskForm):
     code = StringField("Name", validators=[validators.DataRequired()])
 
 
-def get_zetatron_linked_account() -> Optional[str]:
-    # Check if the current user has a partner_id
-    try:
-        zetatron_partner_id = get_zetatron_partner().id
-    except zetatronPartnerNotSetUp:
-        return None
-
-    # It has. Retrieve the information for the PartnerUser
-    zetatron_linked_account = PartnerUser.get_by(
-        user_id=current_user.id, partner_id=zetatron_partner_id
-    )
-    if zetatron_linked_account is None:
-        return None
-    return zetatron_linked_account.partner_email
-
-
-def get_partner_subscription_and_name(
-    user_id: int,
-) -> Optional[Tuple[PartnerSubscription, str]]:
-    partner_sub = PartnerSubscription.find_by_user_id(user_id)
-    if not partner_sub or not partner_sub.is_active():
-        return None
-
-    partner = partner_sub.partner_user.partner
-    return (partner_sub, partner.name)
-
 
 @dashboard_bp.route("/setting", methods=["GET", "POST"])
 @login_required
