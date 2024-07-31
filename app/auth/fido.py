@@ -97,23 +97,7 @@ def fido():
                 webauthn_user, sk_assertion, challenge, URL, uv_required=False
             )
             new_sign_count = webauthn_assertion_response.verify()
-        except Exception as e:
-            LOG.w(f"An error occurred in WebAuthn verification process: {e}")
-            flash("Key verification failed.", "warning")
-            
-            g.deduct_limit = True
-            auto_activate = False
-        else:
-            user.fido_sign_count = new_sign_count
-            Session.commit()
-            del session[MFA_USER_ID]
 
-            session["sudo_time"] = int(time())
-            login_user(user)
-            flash("Welcome back!", "success")
-
-            
-            response = make_response(redirect(next_url or url_for("dashboard.index")))
 
             if fido_token_form.remember.data:
                 browser = MfaBrowser.create_new(user=user)
