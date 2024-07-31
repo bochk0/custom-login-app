@@ -222,32 +222,6 @@ def get_alias_infos_with_pagination_v3(
     return ret
 
 
-def get_alias_info(alias: Alias) -> AliasInfo:
-    q = (
-        Session.query(Contact, EmailLog)
-        .filter(Contact.alias_id == alias.id)
-        .filter(EmailLog.contact_id == Contact.id)
-    )
-
-    alias_info = AliasInfo(
-        alias=alias,
-        nb_blocked=0,
-        nb_forward=0,
-        nb_reply=0,
-        mailbox=alias.mailbox,
-        mailboxes=[alias.mailbox],
-    )
-
-    for _, el in q:
-        if el.is_reply:
-            alias_info.nb_reply += 1
-        elif el.blocked:
-            alias_info.nb_blocked += 1
-        else:
-            alias_info.nb_forward += 1
-
-    return alias_info
-
 
 def get_alias_info_v2(alias: Alias, mailbox=None) -> AliasInfo:
     if not mailbox:
