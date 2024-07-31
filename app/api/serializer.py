@@ -204,3 +204,179 @@ def get_alias_infos_with_pagination_v3(
     q = q.limit(page_limit).offset(page_id * page_size)
 
     ret = []
+    for alias, contact, email_log, nb_reply, nb_blocked, nb_forward in list(q):
+        ret.append(
+            AliasInfo(
+                alias=alias,
+                mailbox=alias.mailbox,
+                mailboxes=alias.mailboxes,
+                nb_forward=nb_forward,
+                nb_blocked=nb_blocked,
+                nb_reply=nb_reply,
+                latest_email_log=email_log,
+                latest_contact=contact,
+                custom_domain=alias.custom_domain,
+            )
+        )
+
+    return ret
+
+
+def get_alias_info(alias: Alias) -> AliasInfo:
+    q = (
+        Session.query(Contact, EmailLog)
+        .filter(Contact.alias_id == alias.id)
+        .filter(EmailLog.contact_id == Contact.id)
+    )
+
+    alias_info = AliasInfo(
+        alias=alias,
+        nb_blocked=0,
+        nb_forward=0,
+        nb_reply=0,
+        mailbox=alias.mailbox,
+        mailboxes=[alias.mailbox],
+    )
+
+    for _, el in q:
+        if el.is_reply:
+            alias_info.nb_reply += 1
+        elif el.blocked:
+            alias_info.nb_blocked += 1
+        else:
+            alias_info.nb_forward += 1
+
+    return alias_info
+
+
+def get_alias_info_v2(alias: Alias, mailbox=None) -> AliasInfo:
+    if not mailbox:
+        mailbox = alias.mailbox
+
+    q = (
+        Session.query(Contact, EmailLog)
+        .filter(Contact.alias_id == alias.id)
+        .filter(EmailLog.contact_id == Contact.id)
+    )
+
+    latest_activity: Arrow = alias.created_at
+    latest_email_log = None
+    latest_contact = None
+
+    alias_info = AliasInfo(
+        alias=alias,
+        nb_blocked=0,
+        nb_forward=0,
+        nb_reply=0,
+        mailbox=mailbox,
+        mailboxes=[mailbox],
+    )
+
+    for m in alias._mailboxes:
+        alias_info.mailboxes.append(m)
+
+    
+    
+    alias_info.mailboxes = list(set(alias_info.mailboxes))
+
+    for contact, email_log in q:
+        if email_log.is_reply:
+            alias_info.nb_reply += 1
+        elif email_log.blocked:
+            alias_info.nb_blocked += 1
+        else:
+            alias_info.nb_forward += 1
+
+        if email_log.created_at > latest_activity:
+            latest_activity = email_log.created_at
+            latest_email_log = email_log
+            latest_contact = contact
+
+    alias_info.latest_contact = latest_contact
+    alias_info.latest_email_log = latest_email_log
+
+    return alias_info
+
+
+def get_alias_contacts(alias, page_id: int) -> [dict]:
+    q = (
+        Contact.filter_by(alias_id=alias.id)
+        .order_by(Contact.id.desc())
+        .limit(PAGE_LIMIT)
+        .offset(page_id * PAGE_LIMIT)
+    )
+
+    res = []
+    for fe in q.all():
+        res.append(serialize_contact(fe))
+
+    return res
+
+
+def get_alias_info_v3(user: User, alias_id: int) -> AliasInfo:
+    
+    q = construct_alias_query(user)
+    q = q.filter(Alias.id == alias_id)
+
+    for alias, contact, email_log, nb_reply, nb_blocked, nb_forward in q:
+        return AliasInfo(
+            alias=alias,
+            mailbox=alias.mailbox,
+            mailboxes=alias.mailboxes,
+            nb_forward=nb_forward,
+            nb_blocked=nb_blocked,
+            nb_reply=nb_reply,
+            latest_email_log=email_log,
+            latest_contact=contact,
+            custom_domain=alias.custom_domain,
+        )
+
+
+def construct_alias_query(user: User):
+    
+    alias_activity_subquery = (
+        Session.query(
+            Alias.id,
+            func.sum(case([(EmailLog.is_reply, 1)], else_=0)).label("nb_reply"),
+            func.sum(
+                case(
+                    [(and_(EmailLog.is_reply.is_(False), EmailLog.blocked), 1)],
+                    else_=0,
+                )
+            ).label("nb_blocked"),
+            func.sum(
+                case(
+                    [
+                        (
+                            and_(
+                                EmailLog.is_reply.is_(False),
+                                EmailLog.blocked.is_(False),
+                            ),
+                            1,
+                        )
+                    ],
+                    else_=0,
+                )
+            ).label("nb_forward"),
+        )
+        .join(EmailLog, Alias.id == EmailLog.alias_id, isouter=True)
+        .filter(Alias.user_id == user.id)
+        .group_by(Alias.id)
+        .subquery()
+    )
+
+    return (
+        Session.query(
+            Alias,
+            Contact,
+            EmailLog,
+            alias_activity_subquery.c.nb_reply,
+            alias_activity_subquery.c.nb_blocked,
+            alias_activity_subquery.c.nb_forward,
+        )
+        .options(joinedload(Alias.hibp_breaches))
+        .options(joinedload(Alias.custom_domain))
+        .join(EmailLog, Alias.last_email_log_id == EmailLog.id, isouter=True)
+        .join(Contact, EmailLog.contact_id == Contact.id, isouter=True)
+        .filter(Alias.id == alias_activity_subquery.c.id)
+    )
