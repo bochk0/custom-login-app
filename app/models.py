@@ -409,29 +409,7 @@ class User(Base, ModelMixin, UserMixin, PasswordOracle):
     max_spam_score = sa.Column(sa.Integer, nullable=True)
 
     
-    newsletter_alias_id = sa.Column(
-        sa.ForeignKey("alias.id", ondelete="SET NULL"),
-        nullable=True,
-        default=None,
-        index=True,
-    )
 
-    
-    include_sender_in_reverse_alias = sa.Column(
-        sa.Boolean, default=True, nullable=False, server_default="0"
-    )
-
-    
-    
-    
-    random_alias_suffix = sa.Column(
-        sa.Integer,
-        nullable=False,
-        default=AliasSuffixEnum.word.value,
-        server_default=str(AliasSuffixEnum.random_string.value),
-    )
-
-    
     expand_alias_info = sa.Column(
         sa.Boolean, default=False, nullable=False, server_default="0"
     )
@@ -457,3 +435,236 @@ class User(Base, ModelMixin, UserMixin, PasswordOracle):
     one_click_unsubscribe_block_sender = sa.Column(
         sa.Boolean, default=False, nullable=False, server_default="0"
     )
+
+
+    include_website_in_one_click_alias = sa.Column(
+        sa.Boolean,
+        
+        default=True,
+        nullable=False,
+        
+        server_default="0",
+    )
+
+    _directory_quota = sa.Column(
+        "directory_quota", sa.Integer, default=50, nullable=False, server_default="50"
+    )
+
+    _subdomain_quota = sa.Column(
+        "subdomain_quota", sa.Integer, default=5, nullable=False, server_default="5"
+    )
+
+    
+    disable_import = sa.Column(
+        sa.Boolean, default=False, nullable=False, server_default="0"
+    )
+
+    
+    can_use_phone = sa.Column(
+        sa.Boolean, default=False, nullable=False, server_default="0"
+    )
+
+    
+    phone_quota = sa.Column(sa.Integer, nullable=True)
+
+    
+    block_behaviour = sa.Column(
+        sa.Enum(BlockBehaviourEnum),
+        nullable=False,
+        server_default=BlockBehaviourEnum.return_2xx.name,
+    )
+
+    include_header_email_header = sa.Column(
+        sa.Boolean, default=True, nullable=False, server_default="1"
+    )
+
+    
+    enable_data_breach_check = sa.Column(
+        sa.Boolean, default=False, nullable=False, server_default="0"
+    )
+
+    
+    flags = sa.Column(
+        sa.BigInteger,
+        default=FLAG_FREE_DISABLE_CREATE_ALIAS,
+        server_default="0",
+        nullable=False,
+    )
+
+    
+    unsub_behaviour = sa.Column(
+        IntEnumType(UnsubscribeBehaviourEnum),
+        default=UnsubscribeBehaviourEnum.PreserveOriginal,
+        server_default=str(UnsubscribeBehaviourEnum.DisableAlias.value),
+        nullable=False,
+    )
+
+    
+    delete_on = sa.Column(ArrowType, default=None)
+
+    __table_args__ = (
+        sa.Index(
+            "ix_users_activated_trial_end_lifetime", activated, trial_end, lifetime
+        ),
+        sa.Index("ix_users_delete_on", delete_on),
+    )
+
+    @property
+    def directory_quota(self):
+        return min(
+            self._directory_quota,
+            config.MAX_NB_DIRECTORY - Directory.filter_by(user_id=self.id).count(),
+        )
+
+    @property
+    def subdomain_quota(self):
+        return min(
+            self._subdomain_quota,
+            config.MAX_NB_SUBDOMAIN
+            - CustomDomain.filter_by(user_id=self.id, is_sl_subdomain=True).count(),
+        )
+
+    @property
+    def created_by_partner(self):
+        return User.FLAG_CREATED_FROM_PARTNER == (
+            self.flags & User.FLAG_CREATED_FROM_PARTNER
+        )
+
+    @staticmethod
+    def subdomain_is_available():
+        return SLDomain.filter_by(can_use_subdomain=True).count() > 0
+
+    
+    def get_id(self):
+        if self.alternative_id:
+            return self.alternative_id
+        else:
+            return str(self.id)
+
+    @classmethod
+    def create(cls, email, name="", password=None, from_partner=False, **kwargs):
+        email = sanitize_email(email)
+        user: User = super(User, cls).create(email=email, name=name[:100], **kwargs)
+
+        if password:
+            user.set_password(password)
+
+        Session.flush()
+
+        mb = Mailbox.create(user_id=user.id, email=user.email, verified=True)
+        Session.flush()
+        user.default_mailbox_id = mb.id
+
+        
+        if "alternative_id" not in kwargs:
+            user.alternative_id = str(uuid.uuid4())
+
+        
+        
+        if from_partner:
+            user.flags = User.FLAG_CREATED_FROM_PARTNER
+            user.notification = False
+            user.trial_end = None
+            Job.create(
+                name=config.JOB_SEND__WELCOME_1,
+                payload={"user_id": user.id},
+                run_at=arrow.now(),
+            )
+            Session.flush()
+            return user
+
+        
+        alias = Alias.create_new(
+            user,
+            prefix="login-newsletter",
+            mailbox_id=mb.id,
+            note="This is your first alias. It's used to receive Login communications "
+            "like new features announcements, newsletters.",
+        )
+        Session.flush()
+
+        user.newsletter_alias_id = alias.id
+        Session.flush()
+
+        if config.DISABLE_ONBOARDING:
+            LOG.d("Disable onboarding emails")
+            return user
+
+        
+        Job.create(
+            name=config.JOB_ONBOARDING_1,
+            payload={"user_id": user.id},
+            run_at=arrow.now().shift(days=1),
+        )
+        Job.create(
+            name=config.JOB_ONBOARDING_2,
+            payload={"user_id": user.id},
+            run_at=arrow.now().shift(days=2),
+        )
+        Job.create(
+            name=config.JOB_ONBOARDING_4,
+            payload={"user_id": user.id},
+            run_at=arrow.now().shift(days=3),
+        )
+        Session.flush()
+
+        return user
+
+    @classmethod
+    def delete(cls, obj_id, commit=False):
+        
+        from app.events.event_dispatcher import EventDispatcher
+        from app.events.generated.event_pb2 import UserDeleted, EventContent
+
+        user: User = cls.get(obj_id)
+        EventDispatcher.send_event(user, EventContent(user_deleted=UserDeleted()))
+
+        
+        from app.alias_utils import delete_alias
+
+        for alias in Alias.filter_by(user_id=user.id):
+            delete_alias(alias, user, AliasDeleteReason.UserHasBeenDeleted)
+
+        res = super(User, cls).delete(obj_id)
+        if commit:
+            Session.commit()
+
+        return res
+
+    def get_active_subscription(
+        self, include_partner_subscription: bool = True
+    ) -> Optional[
+        Union[
+            Subscription
+            | AppleSubscription
+            | ManualSubscription
+            | CoinbaseSubscription
+            | PartnerSubscription
+        ]
+    ]:
+        sub: Subscription = self.get__subscription()
+        if sub:
+            return sub
+
+        apple_sub: AppleSubscription = AppleSubscription.get_by(user_id=self.id)
+        if apple_sub and apple_sub.is_valid():
+            return apple_sub
+
+        manual_sub: ManualSubscription = ManualSubscription.get_by(user_id=self.id)
+        if manual_sub and manual_sub.is_active():
+            return manual_sub
+
+        coinbase_subscription: CoinbaseSubscription = CoinbaseSubscription.get_by(
+            user_id=self.id
+        )
+        if coinbase_subscription and coinbase_subscription.is_active():
+            return coinbase_subscription
+
+        if include_partner_subscription:
+            partner_sub: PartnerSubscription = PartnerSubscription.find_by_user_id(
+                self.id
+            )
+            if partner_sub and partner_sub.is_active():
+                return partner_sub
+
+        return None
