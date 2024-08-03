@@ -2052,25 +2052,6 @@ class EmailChange(Base, ModelMixin):
         return f"<EmailChange {self.id} {self.new_email} {self.user_id}>"
 
 
-class AliasUsedOn(Base, ModelMixin):
-    """Used to know where an alias is created"""
-
-    __tablename__ = "alias_used_on"
-
-    __table_args__ = (
-        sa.UniqueConstraint("alias_id", "hostname", name="uq_alias_used"),
-    )
-
-    alias_id = sa.Column(
-        sa.ForeignKey(Alias.id, ondelete="cascade"), nullable=False, index=True
-    )
-    user_id = sa.Column(sa.ForeignKey(User.id, ondelete="cascade"), nullable=False)
-
-    alias = orm.relationship(Alias)
-
-    hostname = sa.Column(sa.String(1024), nullable=False)
-
-
 class ApiKey(Base, ModelMixin):
     """used in browser extension to identify user"""
 
@@ -2211,3 +2192,216 @@ class CustomDomain(Base, ModelMixin):
     @property
     def auto_create_rules(self):
         return sorted(self._auto_create_rules, key=lambda rule: rule.order)
+
+    def __repr__(self):
+        return f"<Custom Domain {self.id} {self.domain}>"
+
+
+class AutoCreateRule(Base, ModelMixin):
+    """Alias auto creation rule for custom domain"""
+
+    __tablename__ = "auto_create_rule"
+
+    __table_args__ = (
+        sa.UniqueConstraint(
+            "custom_domain_id", "order", name="uq_auto_create_rule_order"
+        ),
+    )
+
+    custom_domain_id = sa.Column(
+        sa.ForeignKey(CustomDomain.id, ondelete="cascade"), nullable=False
+    )
+    
+    regex = sa.Column(sa.String(512), nullable=False)
+
+    
+    order = sa.Column(sa.Integer, default=0, nullable=False)
+
+    custom_domain = orm.relationship(CustomDomain, backref="_auto_create_rules")
+
+    mailboxes = orm.relationship(
+        "Mailbox", secondary="auto_create_rule__mailbox", lazy="joined"
+    )
+
+
+class AutoCreateRuleMailbox(Base, ModelMixin):
+    """store auto create rule - mailbox association"""
+
+    __tablename__ = "auto_create_rule__mailbox"
+    __table_args__ = (
+        sa.UniqueConstraint(
+            "auto_create_rule_id", "mailbox_id", name="uq_auto_create_rule_mailbox"
+        ),
+    )
+
+    auto_create_rule_id = sa.Column(
+        sa.ForeignKey(AutoCreateRule.id, ondelete="cascade"), nullable=False
+    )
+    mailbox_id = sa.Column(
+        sa.ForeignKey("mailbox.id", ondelete="cascade"), nullable=False
+    )
+
+
+class DomainDeletedAlias(Base, ModelMixin):
+    """Store all deleted alias for a domain"""
+
+    __tablename__ = "domain_deleted_alias"
+
+    __table_args__ = (
+        sa.UniqueConstraint("domain_id", "email", name="uq_domain_trash"),
+    )
+
+    email = sa.Column(sa.String(256), nullable=False)
+    domain_id = sa.Column(
+        sa.ForeignKey("custom_domain.id", ondelete="cascade"), nullable=False
+    )
+    user_id = sa.Column(sa.ForeignKey(User.id, ondelete="cascade"), nullable=False)
+
+    domain = orm.relationship(CustomDomain)
+    user = orm.relationship(User, foreign_keys=[user_id])
+    reason = sa.Column(
+        IntEnumType(AliasDeleteReason),
+        nullable=False,
+        default=AliasDeleteReason.Unspecified,
+        server_default=str(AliasDeleteReason.Unspecified.value),
+    )
+
+    @classmethod
+    def create(cls, **kw):
+        raise Exception("should use delete_alias(alias,user) instead")
+
+    def __repr__(self):
+        return f"<DomainDeletedAlias {self.id} {self.email}>"
+
+
+class LifetimeCoupon(Base, ModelMixin):
+    __tablename__ = "lifetime_coupon"
+
+    code = sa.Column(sa.String(128), nullable=False, unique=True)
+    nb_used = sa.Column(sa.Integer, nullable=False)
+    paid = sa.Column(sa.Boolean, default=False, server_default="0", nullable=False)
+    comment = sa.Column(sa.Text, nullable=True)
+
+
+class Coupon(Base, ModelMixin):
+    __tablename__ = "coupon"
+
+    code = sa.Column(sa.String(128), nullable=False, unique=True)
+
+    
+    nb_year = sa.Column(sa.Integer, nullable=False, server_default="1", default=1)
+
+    
+    used = sa.Column(sa.Boolean, default=False, server_default="0", nullable=False)
+
+    
+    
+    used_by_user_id = sa.Column(
+        sa.ForeignKey(User.id, ondelete="cascade"), nullable=True
+    )
+
+    is_giveaway = sa.Column(
+        sa.Boolean, default=False, nullable=False, server_default="0"
+    )
+
+    comment = sa.Column(sa.Text, nullable=True)
+
+    
+    expires_date = sa.Column(ArrowType, nullable=True)
+
+
+class Directory(Base, ModelMixin):
+    __tablename__ = "directory"
+    user_id = sa.Column(sa.ForeignKey(User.id, ondelete="cascade"), nullable=False)
+    name = sa.Column(sa.String(128), unique=True, nullable=False)
+    
+    disabled = sa.Column(sa.Boolean, default=False, nullable=False, server_default="0")
+
+    user = orm.relationship(User, backref="directories")
+
+    _mailboxes = orm.relationship(
+        "Mailbox", secondary="directory_mailbox", lazy="joined"
+    )
+
+    @property
+    def mailboxes(self):
+        if self._mailboxes:
+            return self._mailboxes
+        else:
+            return [self.user.default_mailbox]
+
+    def nb_alias(self):
+        return Alias.filter_by(directory_id=self.id).count()
+
+    @classmethod
+    def create(cls, *args, **kwargs):
+        name = kwargs.get("name")
+        if DeletedDirectory.get_by(name=name):
+            raise DirectoryInTrashError
+
+        directory = super(Directory, cls).create(*args, **kwargs)
+        Session.flush()
+
+        user = directory.user
+        user._directory_quota -= 1
+
+        Session.flush()
+        return directory
+
+    @classmethod
+    def delete(cls, obj_id):
+        obj: Directory = cls.get(obj_id)
+        user = obj.user
+        
+        for alias in Alias.filter_by(directory_id=obj_id):
+            from app import alias_utils
+
+            alias_utils.delete_alias(alias, user, AliasDeleteReason.DirectoryDeleted)
+
+        DeletedDirectory.create(name=obj.name)
+        cls.filter(cls.id == obj_id).delete()
+
+        Session.commit()
+
+    def __repr__(self):
+        return f"<Directory {self.name}>"
+
+
+class Job(Base, ModelMixin):
+    """Used to schedule one-time job in the future"""
+
+    __tablename__ = "job"
+
+    name = sa.Column(sa.String(128), nullable=False)
+    payload = sa.Column(sa.JSON)
+
+    
+    taken = sa.Column(sa.Boolean, default=False, nullable=False)
+    run_at = sa.Column(ArrowType)
+    state = sa.Column(
+        sa.Integer,
+        nullable=False,
+        server_default=str(JobState.ready.value),
+        default=JobState.ready.value,
+        index=True,
+    )
+    attempts = sa.Column(sa.Integer, nullable=False, server_default="0", default=0)
+    taken_at = sa.Column(ArrowType, nullable=True)
+
+    __table_args__ = (Index("ix_state_run_at_taken_at", state, run_at, taken_at),)
+
+    def __repr__(self):
+        return f"<Job {self.id} {self.name} {self.payload}>"
+
+
+class Mailbox(Base, ModelMixin):
+    __tablename__ = "mailbox"
+    user_id = sa.Column(
+        sa.ForeignKey(User.id, ondelete="cascade"), nullable=False, index=True
+    )
+    email = sa.Column(sa.String(256), nullable=False, index=True)
+    verified = sa.Column(sa.Boolean, default=False, nullable=False)
+    force_spf = sa.Column(sa.Boolean, default=True, server_default="1", nullable=False)
+
+    
+    new_email = sa.Column(sa.String(256), unique=True)
