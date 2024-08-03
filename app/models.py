@@ -609,27 +609,7 @@ class User(Base, ModelMixin, UserMixin, PasswordOracle):
         Session.flush()
 
         return user
-
-    @classmethod
-    def delete(cls, obj_id, commit=False):
         
-        from app.events.event_dispatcher import EventDispatcher
-        from app.events.generated.event_pb2 import UserDeleted, EventContent
-
-        user: User = cls.get(obj_id)
-        EventDispatcher.send_event(user, EventContent(user_deleted=UserDeleted()))
-
-        
-        from app.alias_utils import delete_alias
-
-        for alias in Alias.filter_by(user_id=user.id):
-            delete_alias(alias, user, AliasDeleteReason.UserHasBeenDeleted)
-
-        res = super(User, cls).delete(obj_id)
-        if commit:
-            Session.commit()
-
-        return res
 
     def get_active_subscription(
         self, include_partner_subscription: bool = True
@@ -668,3 +648,228 @@ class User(Base, ModelMixin, UserMixin, PasswordOracle):
                 return partner_sub
 
         return None
+
+        def get_active_subscription_end(
+        self, include_partner_subscription: bool = True
+    ) -> Optional[arrow.Arrow]:
+        sub = self.get_active_subscription(
+            include_partner_subscription=include_partner_subscription
+        )
+        if isinstance(sub, Subscription):
+            return arrow.get(sub.next_bill_date)
+        if isinstance(sub, Subscription):
+            return sub.expires_date
+        if isinstance(sub, ManualSubscription):
+            return sub.end_at
+        if isinstance(sub, CoinbaseSubscription):
+            return sub.end_at
+        return None
+
+    
+    def lifetime_or_active_subscription(
+        self, include_partner_subscription: bool = True
+    ) -> bool:
+        """True if user has lifetime licence or active subscription"""
+        if self.lifetime:
+            return True
+
+        return self.get_active_subscription(include_partner_subscription) is not None
+
+    def is_paid(self) -> bool:
+        """same as _lifetime_or_active_subscription but not include free manual subscription"""
+        sub = self.get_active_subscription()
+        if sub is None:
+            return False
+
+        if isinstance(sub, ManualSubscription) and sub.is_giveaway:
+            return False
+
+        return True
+
+    def is_active(self) -> bool:
+        if self.delete_on is None:
+            return True
+        return self.delete_on < arrow.now()
+
+    def in_trial(self):
+        """return True if user does not have lifetime licence or an active subscription AND is in trial period"""
+        if self.lifetime_or_active_subscription():
+            return False
+
+        if self.trial_end and arrow.now() < self.trial_end:
+            return True
+
+        return False
+
+    def should_show_upgrade_button(self):
+        if self.lifetime_or_active_subscription():
+            return False
+
+        return True
+
+    def is_premium(self, include_partner_subscription: bool = True) -> bool:
+        """
+        user is premium if they:
+        - have a lifetime deal or
+        - in trial period or
+        - active subscription
+        """
+        if self.lifetime_or_active_subscription(include_partner_subscription):
+            return True
+
+        if self.trial_end and arrow.now() < self.trial_end:
+            return True
+
+        return False
+
+    @property
+    def upgrade_channel(self) -> str:
+        """Used on admin dashboard"""
+        
+        channels = []
+        if self.lifetime:
+            channels.append("Lifetime")
+
+        sub: Subscription = self.get__subscription()
+        if sub:
+            if sub.cancelled:
+                channels.append(
+                    f"""Cancelled  Subscription <a href="https://..com/subscriptions/customers/manage/{sub.subscription_id}">{sub.subscription_id}</a> {sub.plan_name()} ends at {sub.next_bill_date}"""
+                )
+            else:
+                channels.append(
+                    f"""Active  Subscription <a href="https://v..com/subscriptions/customers/manage/{sub.subscription_id}">{sub.subscription_id}</a> {sub.plan_name()}, renews at {sub.next_bill_date}"""
+                )
+
+        _sub: Subscription = Subscription.get_by(user_id=self.id)
+        if _sub and _sub.is_valid():
+            channels.append(f" Subscription {_sub.expires_date.humanize()}")
+
+        manual_sub: ManualSubscription = ManualSubscription.get_by(user_id=self.id)
+        if manual_sub and manual_sub.is_active():
+            mode = "Giveaway" if manual_sub.is_giveaway else "Paid"
+            channels.append(
+                f"Manual Subscription {manual_sub.comment} {mode} {manual_sub.end_at.humanize()}"
+            )
+
+        coinbase_subscription: CoinbaseSubscription = CoinbaseSubscription.get_by(
+            user_id=self.id
+        )
+        if coinbase_subscription and coinbase_subscription.is_active():
+            channels.append(
+                f"Coinbase Subscription ends {coinbase_subscription.end_at.humanize()}"
+            )
+
+        r = (
+            Session.query(PartnerSubscription, PartnerUser, Partner)
+            .filter(
+                PartnerSubscription.partner_user_id == PartnerUser.id,
+                PartnerUser.user_id == self.id,
+                Partner.id == PartnerUser.partner_id,
+            )
+            .first()
+        )
+        if r and r[0].is_active():
+            channels.append(
+                f"Subscription via {r[2].name} partner , ends {r[0].end_at.humanize()}"
+            )
+
+        return ".\n".join(channels)
+
+    
+
+    def max_alias_for_free_account(self) -> int:
+        if (
+            self.FLAG_FREE_OLD_ALIAS_LIMIT
+            == self.flags & self.FLAG_FREE_OLD_ALIAS_LIMIT
+        ):
+            return config.MAX_NB_EMAIL_OLD_FREE_PLAN
+        else:
+            return config.MAX_NB_EMAIL_FREE_PLAN
+
+    def can_create_new_alias(self) -> bool:
+        """
+        Whether user can create a new alias. User can't create a new alias if
+        - has more than 15 aliases in the free plan, *even in the free trial*
+        """
+        if not self.is_active():
+            return False
+
+        if self.disabled:
+            return False
+
+        if self.lifetime_or_active_subscription():
+            return True
+        else:
+            return (
+                Alias.filter_by(user_id=self.id).count()
+                < self.max_alias_for_free_account()
+            )
+
+    def can_send_or_receive(self) -> bool:
+        if self.disabled:
+            LOG.i(f"User {self} is disabled. Cannot receive or send emails")
+            return False
+        if self.delete_on is not None:
+            LOG.i(
+                f"User {self} is scheduled to be deleted. Cannot receive or send emails"
+            )
+            return False
+        return True
+
+    def profile_picture_url(self):
+        if self.profile_picture_id:
+            return self.profile_picture.get_url()
+        else:
+            return url_for("static", filename="default-avatar.png")
+
+    def suggested_emails(self, website_name) -> (str, [str]):
+        """return suggested email and other email choices"""
+        website_name = convert_to_id(website_name)
+
+        all_aliases = [
+            ge.email for ge in Alias.filter_by(user_id=self.id, enabled=True)
+        ]
+        if self.can_create_new_alias():
+            suggested_alias = Alias.create_new(self, prefix=website_name).email
+        else:
+            
+            suggested_alias = random.choice(all_aliases)
+
+        return (
+            suggested_alias,
+            list(set(all_aliases).difference({suggested_alias})),
+        )
+
+    def suggested_names(self) -> (str, [str]):
+        """return suggested name and other name choices"""
+        other_name = convert_to_id(self.name)
+
+        return self.name, [other_name, "Anonymous", "whoami"]
+
+    def get_name_initial(self) -> str:
+        if not self.name:
+            return ""
+        names = self.name.split(" ")
+        return "".join([n[0].upper() for n in names if n])
+
+    def get__subscription(self) -> Optional["Subscription"]:
+        """return *active*  subscription
+        Return None if the subscription is already expired
+        TODO: support user unsubscribe and re-subscribe
+        """
+        sub = Subscription.get_by(user_id=self.id)
+
+        if sub:
+            
+            
+            if (
+                sub.next_bill_date
+                >= arrow.now().shift(days=-_SUBSCRIPTION_GRACE_DAYS).date()
+            ):
+                return sub
+            
+            else:
+                return None
+        else:
+            return sub
