@@ -351,23 +351,10 @@ class User(Base, ModelMixin, UserMixin, PasswordOracle):
     )
 
     
-    lifetime = sa.Column(sa.Boolean, default=False, nullable=False, server_default="0")
-    paid_lifetime = sa.Column(
-        sa.Boolean, default=False, nullable=False, server_default="0"
-    )
-    lifetime_coupon_id = sa.Column(
-        sa.ForeignKey("lifetime_coupon.id", ondelete="SET NULL"),
-        nullable=True,
-        default=None,
-    )
-
-    
     trial_end = sa.Column(
         ArrowType, default=lambda: arrow.now().shift(days=7, hours=1), nullable=True
     )
 
-    
-    
     
     
     default_mailbox_id = sa.Column(
@@ -2954,3 +2941,220 @@ class IgnoreBounceSender(Base, ModelMixin):
 
     def __repr__(self):
         return f"<NoReplySender {self.mail_from}"
+
+    class MessageIDMatching(Base, ModelMixin):
+    """Store the SL Message ID and the original Message ID"""
+
+    __tablename__ = "message_id_matching"
+
+    
+    sl_message_id = sa.Column(sa.String(512), unique=True, nullable=False)
+    original_message_id = sa.Column(sa.String(1024), unique=True, nullable=False)
+
+    
+    email_log_id = sa.Column(
+        sa.ForeignKey("email_log.id", ondelete="cascade"), nullable=True, index=True
+    )
+
+    email_log = orm.relationship("EmailLog")
+
+
+class DeletedDirectory(Base, ModelMixin):
+    """To avoid directory from being reused"""
+
+    __tablename__ = "deleted_directory"
+
+    name = sa.Column(sa.String(128), unique=True, nullable=False)
+
+
+class DeletedSubdomain(Base, ModelMixin):
+    """To avoid directory from being reused"""
+
+    __tablename__ = "deleted_subdomain"
+
+    domain = sa.Column(sa.String(128), unique=True, nullable=False)
+
+
+class InvalidMailboxDomain(Base, ModelMixin):
+    """Domains that can't be used as mailbox"""
+
+    __tablename__ = "invalid_mailbox_domain"
+
+    domain = sa.Column(sa.String(256), unique=True, nullable=False)
+
+
+
+class PhoneCountry(Base, ModelMixin):
+    __tablename__ = "phone_country"
+
+    name = sa.Column(sa.String(128), unique=True, nullable=False)
+
+
+class PhoneNumber(Base, ModelMixin):
+    __tablename__ = "phone_number"
+
+    country_id = sa.Column(
+        sa.ForeignKey(PhoneCountry.id, ondelete="cascade"), nullable=False
+    )
+
+    
+    number = sa.Column(sa.String(128), unique=True, nullable=False)
+
+    active = sa.Column(sa.Boolean, nullable=False, default=True)
+
+    
+    comment = deferred(sa.Column(sa.Text, nullable=True))
+
+    country = orm.relationship(PhoneCountry)
+
+
+class PhoneReservation(Base, ModelMixin):
+    __tablename__ = "phone_reservation"
+
+    number_id = sa.Column(
+        sa.ForeignKey(PhoneNumber.id, ondelete="cascade"), nullable=False
+    )
+
+    user_id = sa.Column(sa.ForeignKey(User.id, ondelete="cascade"), nullable=False)
+
+    number = orm.relationship(PhoneNumber)
+
+    start = sa.Column(ArrowType, nullable=False)
+    end = sa.Column(ArrowType, nullable=False)
+
+
+class PhoneMessage(Base, ModelMixin):
+    __tablename__ = "phone_message"
+
+    number_id = sa.Column(
+        sa.ForeignKey(PhoneNumber.id, ondelete="cascade"), nullable=False
+    )
+
+    from_number = sa.Column(sa.String(128), nullable=False)
+    body = sa.Column(sa.Text)
+
+    number = orm.relationship(PhoneNumber)
+
+
+class AdminAuditLog(Base):
+    __tablename__ = "admin_audit_log"
+
+    id = sa.Column(sa.Integer, primary_key=True, autoincrement=True)
+    created_at = sa.Column(ArrowType, default=arrow.utcnow, nullable=False)
+    admin_user_id = sa.Column(
+        sa.ForeignKey("users.id", ondelete="cascade"), nullable=False, index=True
+    )
+    action = sa.Column(sa.Integer, nullable=False)
+    model = sa.Column(sa.Text, nullable=False)
+    model_id = sa.Column(sa.Integer, nullable=True)
+    data = sa.Column(sa.JSON, nullable=False)
+
+    admin = orm.relationship(User, foreign_keys=[admin_user_id])
+
+    @classmethod
+    def create(cls, **kw):
+        r = cls(**kw)
+        Session.add(r)
+
+        return r
+
+    @classmethod
+    def create_manual_upgrade(
+        cls, admin_user_id: int, upgrade_type: str, user_id: int, giveaway: bool
+    ):
+        cls.create(
+            admin_user_id=admin_user_id,
+            action=AuditLogActionEnum.manual_upgrade.value,
+            model="User",
+            model_id=user_id,
+            data={
+                "upgrade_type": upgrade_type,
+                "giveaway": giveaway,
+            },
+        )
+
+    @classmethod
+    def extend_trial(
+        cls, admin_user_id: int, user_id: int, trial_end: arrow.Arrow, extend_time: str
+    ):
+        cls.create(
+            admin_user_id=admin_user_id,
+            action=AuditLogActionEnum.extend_trial.value,
+            model="User",
+            model_id=user_id,
+            data={
+                "trial_end": trial_end.format(arrow.FORMAT_RFC3339),
+                "extend_time": extend_time,
+            },
+        )
+
+    @classmethod
+    def stop_trial(cls, admin_user_id: int, user_id: int):
+        cls.create(
+            admin_user_id=admin_user_id,
+            action=AuditLogActionEnum.stop_trial.value,
+            model="User",
+            model_id=user_id,
+            data={},
+        )
+
+    @classmethod
+    def disable_otp_fido(
+        cls, admin_user_id: int, user_id: int, had_otp: bool, had_fido: bool
+    ):
+        cls.create(
+            admin_user_id=admin_user_id,
+            action=AuditLogActionEnum.disable_2fa.value,
+            model="User",
+            model_id=user_id,
+            data={"had_otp": had_otp, "had_fido": had_fido},
+        )
+
+    @classmethod
+    def logged_as_user(cls, admin_user_id: int, user_id: int):
+        cls.create(
+            admin_user_id=admin_user_id,
+            action=AuditLogActionEnum.logged_as_user.value,
+            model="User",
+            model_id=user_id,
+            data={},
+        )
+
+    @classmethod
+    def extend_subscription(
+        cls,
+        admin_user_id: int,
+        user_id: int,
+        subscription_end: arrow.Arrow,
+        extend_time: str,
+    ):
+        cls.create(
+            admin_user_id=admin_user_id,
+            action=AuditLogActionEnum.extend_subscription.value,
+            model="User",
+            model_id=user_id,
+            data={
+                "subscription_end": subscription_end.format(arrow.FORMAT_RFC3339),
+                "extend_time": extend_time,
+            },
+        )
+
+    @classmethod
+    def downloaded_provider_complaint(cls, admin_user_id: int, complaint_id: int):
+        cls.create(
+            admin_user_id=admin_user_id,
+            action=AuditLogActionEnum.download_provider_complaint.value,
+            model="ProviderComplaint",
+            model_id=complaint_id,
+            data={},
+        )
+
+    @classmethod
+    def disable_user(cls, admin_user_id: int, user_id: int):
+        cls.create(
+            admin_user_id=admin_user_id,
+            action=AuditLogActionEnum.disable_user.value,
+            model="User",
+            model_id=user_id,
+            data={},
+        )
