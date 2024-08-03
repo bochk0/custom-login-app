@@ -652,26 +652,6 @@ class User(Base, ModelMixin, UserMixin, PasswordOracle):
 
         return True
 
-    def is_active(self) -> bool:
-        if self.delete_on is None:
-            return True
-        return self.delete_on < arrow.now()
-
-    def in_trial(self):
-        """return True if user does not have lifetime licence or an active subscription AND is in trial period"""
-        if self.lifetime_or_active_subscription():
-            return False
-
-        if self.trial_end and arrow.now() < self.trial_end:
-            return True
-
-        return False
-
-    def should_show_upgrade_button(self):
-        if self.lifetime_or_active_subscription():
-            return False
-
-        return True
 
     def is_premium(self, include_partner_subscription: bool = True) -> bool:
         """
@@ -1657,3 +1637,204 @@ class ClientUser(Base, ModelMixin):
             "email_verified": True,
             "sub": str(self.id),
         }
+
+for scope in self.client.get_scopes():
+            if scope == Scope.NAME:
+                if self.name:
+                    res[Scope.NAME.value] = self.name or ""
+                else:
+                    res[Scope.NAME.value] = self.user.name or ""
+            elif scope == Scope.AVATAR_URL:
+                if self.user.profile_picture_id:
+                    if self.default_avatar:
+                        res[Scope.AVATAR_URL.value] = (
+                            config.URL + "/static/default-avatar.png"
+                        )
+                    else:
+                        res[Scope.AVATAR_URL.value] = self.user.profile_picture.get_url(
+                            config.AVATAR_URL_EXPIRATION
+                        )
+                else:
+                    res[Scope.AVATAR_URL.value] = None
+            elif scope == Scope.EMAIL:
+                
+                if self.alias_id:
+                    LOG.d(
+                        "Use gen email for user %s, client %s", self.user, self.client
+                    )
+                    res[Scope.EMAIL.value] = self.alias.email
+                
+                else:
+                    res[Scope.EMAIL.value] = self.user.email
+
+        return res
+
+
+class Contact(Base, ModelMixin):
+    """
+    Store configuration of sender (website-email) and alias.
+    """
+
+    MAX_NAME_LENGTH = 512
+
+    __tablename__ = "contact"
+
+    __table_args__ = (
+        sa.UniqueConstraint("alias_id", "website_email", name="uq_contact"),
+    )
+
+    user_id = sa.Column(
+        sa.ForeignKey(User.id, ondelete="cascade"), nullable=False, index=True
+    )
+    alias_id = sa.Column(
+        sa.ForeignKey(Alias.id, ondelete="cascade"), nullable=False, index=True
+    )
+
+    name = sa.Column(
+        sa.String(512), nullable=True, default=None, server_default=text("NULL")
+    )
+
+    website_email = sa.Column(sa.String(512), nullable=False)
+
+        
+    website_from = sa.Column(sa.String(1024), nullable=True)
+
+    
+    reply_email = sa.Column(sa.String(512), nullable=False, index=True)
+
+    
+    is_cc = sa.Column(sa.Boolean, nullable=False, default=False, server_default="0")
+
+    pgp_public_key = sa.Column(sa.Text, nullable=True)
+    pgp_finger_print = sa.Column(sa.String(512), nullable=True, index=True)
+
+    alias = orm.relationship(Alias, backref="contacts")
+    user = orm.relationship(User)
+
+    
+    latest_reply: Optional[Arrow] = None
+
+    
+    
+    mail_from = sa.Column(sa.Text, nullable=True, default=None)
+
+    
+    invalid_email = sa.Column(
+        sa.Boolean, nullable=False, default=False, server_default="0"
+    )
+
+    
+    block_forward = sa.Column(
+        sa.Boolean, nullable=False, default=False, server_default="0"
+    )
+
+    
+    automatic_created = sa.Column(sa.Boolean, nullable=True, default=False)
+
+    @property
+    def email(self):
+        return self.website_email
+
+    @classmethod
+    def create(cls, **kw):
+        commit = kw.pop("commit", False)
+        flush = kw.pop("flush", False)
+
+        new_contact = cls(**kw)
+
+        website_email = kw["website_email"]
+        
+        website_email = sanitize_email(website_email)
+
+        
+        if website_email != config.NOREPLY:
+            orig_contact = Contact.get_by(reply_email=website_email)
+            if orig_contact:
+                raise CannotCreateContactForReverseAlias(str(orig_contact))
+
+        Session.add(new_contact)
+
+        if commit:
+            Session.commit()
+
+        if flush:
+            Session.flush()
+
+        return new_contact
+
+    def website_send_to(self):
+
+        user = self.user
+        name = self.name
+        email = self.website_email
+
+        if (
+            not user
+            or not SenderFormatEnum.has_value(user.sender_format)
+            or user.sender_format == SenderFormatEnum.AT.value
+        ):
+            email = email.replace("@", " at ")
+        elif user.sender_format == SenderFormatEnum.A.value:
+            email = email.replace("@", "(a)")
+
+        
+        if not name and self.website_from:
+            try:
+                name = address.parse(self.website_from).display_name
+            except Exception:
+                
+                LOG.e(
+                    "Cannot parse contact %s website_from %s", self, self.website_from
+                )
+                name = ""
+
+        
+        if name:
+            name = name.replace('"', "")
+
+        if name:
+            name = name + " | " + email
+        else:
+            name = email
+        
+        return f'"{name}" <{self.reply_email}>'
+
+    def new_addr(self):
+
+        user = self.user
+        sender_format = user.sender_format if user else SenderFormatEnum.AT.value
+
+        if sender_format == SenderFormatEnum.NO_NAME.value:
+            return self.reply_email
+
+        if sender_format == SenderFormatEnum.NAME_ONLY.value:
+            new_name = self.name
+        elif sender_format == SenderFormatEnum.AT_ONLY.value:
+            new_name = self.website_email.replace("@", " at ").strip()
+        elif sender_format == SenderFormatEnum.AT.value:
+            formatted_email = self.website_email.replace("@", " at ").strip()
+            new_name = (
+                (self.name + " - " + formatted_email)
+                if self.name and self.name != self.website_email.strip()
+                else formatted_email
+            )
+        else:  
+            formatted_email = self.website_email.replace("@", "(a)").strip()
+            new_name = (
+                (self.name + " - " + formatted_email)
+                if self.name and self.name != self.website_email.strip()
+                else formatted_email
+            )
+
+        from app.email_utils import sl_formataddr
+
+        new_addr = sl_formataddr((new_name, self.reply_email)).strip()
+        return new_addr.strip()
+
+    def last_reply(self) -> "EmailLog":
+        """return the most recent reply"""
+        return (
+            EmailLog.filter_by(contact_id=self.id, is_reply=True)
+            .order_by(desc(EmailLog.created_at))
+            .first()
+        )
