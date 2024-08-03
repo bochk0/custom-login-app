@@ -2246,15 +2246,6 @@ class DomainDeletedAlias(Base, ModelMixin):
         return f"<DomainDeletedAlias {self.id} {self.email}>"
 
 
-class LifetimeCoupon(Base, ModelMixin):
-    __tablename__ = "lifetime_coupon"
-
-    code = sa.Column(sa.String(128), nullable=False, unique=True)
-    nb_used = sa.Column(sa.Integer, nullable=False)
-    paid = sa.Column(sa.Boolean, default=False, server_default="0", nullable=False)
-    comment = sa.Column(sa.Text, nullable=True)
-
-
     @property
     def mailboxes(self):
         if self._mailboxes:
@@ -3157,4 +3148,215 @@ class AdminAuditLog(Base):
             model="User",
             model_id=user_id,
             data={},
+        )
+
+    @classmethod
+    def enable_user(cls, admin_user_id: int, user_id: int):
+        cls.create(
+            admin_user_id=admin_user_id,
+            action=AuditLogActionEnum.enable_user.value,
+            model="User",
+            model_id=user_id,
+            data={},
+        )
+
+
+class ProviderComplaintState(EnumE):
+    new = 0
+    reviewed = 1
+
+
+class ProviderComplaint(Base, ModelMixin):
+    __tablename__ = "provider_complaint"
+
+    user_id = sa.Column(sa.ForeignKey("users.id"), nullable=False)
+    state = sa.Column(
+        sa.Integer, nullable=False, server_default=str(ProviderComplaintState.new.value)
+    )
+    phase = sa.Column(
+        sa.Integer, nullable=False, server_default=str(Phase.unknown.value)
+    )
+    
+    refused_email_id = sa.Column(
+        sa.ForeignKey("refused_email.id", ondelete="cascade"), nullable=True
+    )
+
+    user = orm.relationship(User, foreign_keys=[user_id])
+    refused_email = orm.relationship(RefusedEmail, foreign_keys=[refused_email_id])
+
+
+class PartnerApiToken(Base, ModelMixin):
+    __tablename__ = "partner_api_token"
+
+    token = sa.Column(sa.String(50), unique=True, nullable=False, index=True)
+    partner_id = sa.Column(
+        sa.ForeignKey("partner.id", ondelete="cascade"), nullable=False, index=True
+    )
+    expiration_time = sa.Column(ArrowType, unique=False, nullable=True)
+
+    @staticmethod
+    def generate(
+        partner_id: int, expiration_time: Optional[ArrowType]
+    ) -> Tuple[PartnerApiToken, str]:
+        raw_token = random_string(32)
+        encoded = PartnerApiToken.hmac_token(raw_token)
+        instance = PartnerApiToken.create(
+            token=encoded, partner_id=partner_id, expiration_time=expiration_time
+        )
+        return instance, raw_token
+
+    @staticmethod
+    def hmac_token(token: str) -> str:
+        as_str = base64.b64encode(
+            hmac.new(
+                config.PARTNER_API_TOKEN_SECRET.encode("utf-8"),
+                token.encode("utf-8"),
+                hashlib.sha3_256,
+            ).digest()
+        ).decode("utf-8")
+        return as_str.rstrip("=")
+
+
+class PartnerUser(Base, ModelMixin):
+    __tablename__ = "partner_user"
+
+    user_id = sa.Column(
+        sa.ForeignKey("users.id", ondelete="cascade"),
+        unique=True,
+        nullable=False,
+        index=True,
+    )
+    partner_id = sa.Column(
+        sa.ForeignKey("partner.id", ondelete="cascade"), nullable=False, index=True
+    )
+    external_user_id = sa.Column(sa.String(128), unique=False, nullable=False)
+    partner_email = sa.Column(sa.String(255), unique=False, nullable=True)
+
+    user = orm.relationship(User, foreign_keys=[user_id])
+    partner = orm.relationship(Partner, foreign_keys=[partner_id])
+
+    __table_args__ = (
+        sa.UniqueConstraint(
+            "partner_id", "external_user_id", name="uq_partner_id_external_user_id"
+        ),
+    )
+
+
+class PartnerSubscription(Base, ModelMixin):
+
+    __tablename__ = "partner_subscription"
+
+    partner_user_id = sa.Column(
+        sa.ForeignKey(PartnerUser.id, ondelete="cascade"), nullable=False, unique=True
+    )
+
+    
+    end_at = sa.Column(ArrowType, nullable=False, index=True)
+
+    partner_user = orm.relationship(PartnerUser)
+
+    @classmethod
+    def find_by_user_id(cls, user_id: int) -> Optional[PartnerSubscription]:
+        res = (
+            Session.query(PartnerSubscription, PartnerUser)
+            .filter(
+                and_(
+                    PartnerUser.user_id == user_id,
+                    PartnerSubscription.partner_user_id == PartnerUser.id,
+                )
+            )
+            .first()
+        )
+        if res:
+            subscription, partner_user = res
+            return subscription
+        return None
+
+    def is_active(self):
+        return self.end_at > arrow.now().shift(days=-_PARTNER_SUBSCRIPTION_GRACE_DAYS)
+
+
+class Newsletter(Base, ModelMixin):
+    __tablename__ = "newsletter"
+    subject = sa.Column(sa.String(), nullable=False, index=True)
+
+    html = sa.Column(sa.Text)
+    plain_text = sa.Column(sa.Text)
+
+    def __repr__(self):
+        return f"<Newsletter {self.id} {self.subject}>"
+
+
+class NewsletterUser(Base, ModelMixin):
+
+    __tablename__ = "newsletter_user"
+    user_id = sa.Column(sa.ForeignKey(User.id, ondelete="cascade"), nullable=True)
+    newsletter_id = sa.Column(
+        sa.ForeignKey(Newsletter.id, ondelete="cascade"), nullable=True
+    )
+    
+    sent_at = sa.Column(ArrowType, default=arrow.utcnow, nullable=False)
+
+    user = orm.relationship(User)
+    newsletter = orm.relationship(Newsletter)
+
+
+class ApiToCookieToken(Base, ModelMixin):
+    __tablename__ = "api_cookie_token"
+    code = sa.Column(sa.String(128), unique=True, nullable=False)
+    user_id = sa.Column(sa.ForeignKey(User.id, ondelete="cascade"), nullable=False)
+    api_key_id = sa.Column(sa.ForeignKey(ApiKey.id, ondelete="cascade"), nullable=False)
+
+    user = orm.relationship(User)
+    api_key = orm.relationship(ApiKey)
+
+    @classmethod
+    def create(cls, **kwargs):
+        code = secrets.token_urlsafe(32)
+
+        return super().create(code=code, **kwargs)
+
+
+class SyncEvent(Base, ModelMixin):
+
+    __tablename__ = "sync_event"
+    content = sa.Column(sa.LargeBinary, unique=False, nullable=False)
+    taken_time = sa.Column(
+        ArrowType, default=None, nullable=True, server_default=None, index=True
+    )
+    retry_count = sa.Column(sa.Integer, default=0, nullable=False, server_default="0")
+
+    __table_args__ = (
+        sa.Index("ix_sync_event_created_at", "created_at"),
+        sa.Index("ix_sync_event_taken_time", "taken_time"),
+    )
+
+    def mark_as_taken(self) -> bool:
+        sql = 
+        args = {"taken_time": arrow.now().datetime, "sync_event_id": self.id}
+
+        res = Session.execute(sql, args)
+        Session.commit()
+
+        return res.rowcount > 0
+
+    @classmethod
+    def get_dead_letter(cls, older_than: Arrow, max_retries: int) -> [SyncEvent]:
+        return (
+            SyncEvent.filter(
+                (
+                    (
+                        SyncEvent.taken_time.isnot(None)
+                        & (SyncEvent.taken_time < older_than)
+                    )
+                    | (
+                        SyncEvent.taken_time.is_(None)
+                        & (SyncEvent.created_at < older_than)
+                    )
+                )
+                & (SyncEvent.retry_count < max_retries)
+            )
+            .order_by(SyncEvent.id)
+            .limit(100)
+            .all()
         )
