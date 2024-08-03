@@ -2268,33 +2268,6 @@ class LifetimeCoupon(Base, ModelMixin):
     comment = sa.Column(sa.Text, nullable=True)
 
 
-class Coupon(Base, ModelMixin):
-    __tablename__ = "coupon"
-
-    code = sa.Column(sa.String(128), nullable=False, unique=True)
-
-    
-    nb_year = sa.Column(sa.Integer, nullable=False, server_default="1", default=1)
-
-    
-    used = sa.Column(sa.Boolean, default=False, server_default="0", nullable=False)
-
-    
-    
-    used_by_user_id = sa.Column(
-        sa.ForeignKey(User.id, ondelete="cascade"), nullable=True
-    )
-
-    is_giveaway = sa.Column(
-        sa.Boolean, default=False, nullable=False, server_default="0"
-    )
-
-    comment = sa.Column(sa.Text, nullable=True)
-
-    
-    expires_date = sa.Column(ArrowType, nullable=True)
-
-
     @property
     def mailboxes(self):
         if self._mailboxes:
@@ -2782,3 +2755,202 @@ class SLDomain(Base, ModelMixin):
         default=None,
         server_default="NULL",
     )
+
+       hidden = sa.Column(sa.Boolean, nullable=False, default=False, server_default="0")
+
+    
+    order = sa.Column(sa.Integer, nullable=False, default=0, server_default="0")
+
+    use_as_reverse_alias = sa.Column(
+        sa.Boolean, nullable=False, default=False, server_default="0"
+    )
+
+    def __repr__(self):
+        return f"<SLDomain {self.id} {self.domain} {'Premium' if self.premium_only else 'Free'}>"
+
+
+class Monitoring(Base, ModelMixin):
+
+    __tablename__ = "monitoring"
+
+    host = sa.Column(sa.String(256), nullable=False)
+
+    
+    incoming_queue = sa.Column(sa.Integer, nullable=False)
+    active_queue = sa.Column(sa.Integer, nullable=False)
+    deferred_queue = sa.Column(sa.Integer, nullable=False)
+
+    __table_args__ = (Index("ix_monitoring_created_at", "created_at"),)
+
+
+class BatchImport(Base, ModelMixin):
+    __tablename__ = "batch_import"
+    user_id = sa.Column(sa.ForeignKey(User.id, ondelete="cascade"), nullable=False)
+    file_id = sa.Column(sa.ForeignKey(File.id, ondelete="cascade"), nullable=False)
+    processed = sa.Column(sa.Boolean, nullable=False, default=False)
+    summary = sa.Column(sa.Text, nullable=True, default=None)
+
+    file = orm.relationship(File)
+    user = orm.relationship(User)
+
+    def nb_alias(self):
+        return Alias.filter_by(batch_import_id=self.id).count()
+
+    def __repr__(self):
+        return f"<BatchImport {self.id}>"
+
+
+class AuthorizedAddress(Base, ModelMixin):
+    """Authorize other addresses to send emails from aliases that are owned by a mailbox"""
+
+    __tablename__ = "authorized_address"
+
+    user_id = sa.Column(sa.ForeignKey(User.id, ondelete="cascade"), nullable=False)
+    mailbox_id = sa.Column(
+        sa.ForeignKey(Mailbox.id, ondelete="cascade"), nullable=False
+    )
+    email = sa.Column(sa.String(256), nullable=False)
+
+    __table_args__ = (
+        sa.UniqueConstraint("mailbox_id", "email", name="uq_authorize_address"),
+    )
+
+    mailbox = orm.relationship(Mailbox, backref="authorized_addresses")
+
+    def __repr__(self):
+        return f"<AuthorizedAddress {self.id} {self.email} {self.mailbox_id}>"
+
+
+class Metric2(Base, ModelMixin):
+
+    __tablename__ = "metric2"
+    date = sa.Column(ArrowType, default=arrow.utcnow, nullable=False)
+
+    nb_user = sa.Column(sa.Float, nullable=True)
+    nb_activated_user = sa.Column(sa.Float, nullable=True)
+    nb__user = sa.Column(sa.Float, nullable=True)
+
+    nb_premium = sa.Column(sa.Float, nullable=True)
+    nb__premium = sa.Column(sa.Float, nullable=True)
+    nb_cancelled_premium = sa.Column(sa.Float, nullable=True)
+    nb_manual_premium = sa.Column(sa.Float, nullable=True)
+    nb_coinbase_premium = sa.Column(sa.Float, nullable=True)
+    nb__premium = sa.Column(sa.Float, nullable=True)
+
+    
+    nb_referred_user = sa.Column(sa.Float, nullable=True)
+    nb_referred_user_paid = sa.Column(sa.Float, nullable=True)
+
+    nb_alias = sa.Column(sa.Float, nullable=True)
+
+    
+    nb_forward = sa.Column(sa.Float, nullable=True)
+    nb_block = sa.Column(sa.Float, nullable=True)
+    nb_reply = sa.Column(sa.Float, nullable=True)
+    nb_bounced = sa.Column(sa.Float, nullable=True)
+    nb_spam = sa.Column(sa.Float, nullable=True)
+
+    
+    nb_forward_last_24h = sa.Column(sa.Float, nullable=True)
+    nb_block_last_24h = sa.Column(sa.Float, nullable=True)
+    nb_reply_last_24h = sa.Column(sa.Float, nullable=True)
+    nb_bounced_last_24h = sa.Column(sa.Float, nullable=True)
+    
+    nb_total_bounced_last_24h = sa.Column(sa.Float, nullable=True)
+
+    nb_verified_custom_domain = sa.Column(sa.Float, nullable=True)
+    nb_subdomain = sa.Column(sa.Float, nullable=True)
+    nb_directory = sa.Column(sa.Float, nullable=True)
+
+    nb_deleted_directory = sa.Column(sa.Float, nullable=True)
+    nb_deleted_subdomain = sa.Column(sa.Float, nullable=True)
+
+    nb_app = sa.Column(sa.Float, nullable=True)
+
+
+class DailyMetric(Base, ModelMixin):
+
+    __tablename__ = "daily_metric"
+    date = sa.Column(sa.Date, nullable=False, unique=True)
+
+    
+    nb_new_web_non__user = sa.Column(
+        sa.Integer, nullable=False, server_default="0", default=0
+    )
+
+    nb_alias = sa.Column(sa.Integer, nullable=False, server_default="0", default=0)
+
+    @staticmethod
+    def get_or_create_today_metric() -> DailyMetric:
+        today = arrow.utcnow().date()
+        daily_metric = DailyMetric.get_by(date=today)
+        if not daily_metric:
+            daily_metric = DailyMetric.create(
+                date=today, nb_new_web_non__user=0, nb_alias=0
+            )
+        return daily_metric
+
+
+class Bounce(Base, ModelMixin):
+    """Record all bounces. Deleted after 7 days"""
+
+    __tablename__ = "bounce"
+    email = sa.Column(sa.String(256), nullable=False, index=True)
+    info = sa.Column(sa.Text, nullable=True)
+
+    __table_args__ = (sa.Index("ix_bounce_created_at", "created_at"),)
+
+
+class TransactionalEmail(Base, ModelMixin):
+
+    __tablename__ = "transactional_email"
+    email = sa.Column(sa.String(256), nullable=False, unique=False)
+
+    __table_args__ = (sa.Index("ix_transactional_email_created_at", "created_at"),)
+
+    @classmethod
+    def create(cls, **kw):
+        
+        commit = kw.pop("commit", False)
+
+        r = cls(**kw)
+        if not config.STORE_TRANSACTIONAL_EMAILS:
+            return r
+
+        Session.add(r)
+        if commit:
+            Session.commit()
+        return r
+
+
+class Payout(Base, ModelMixin):
+
+    __tablename__ = "payout"
+    user_id = sa.Column(sa.ForeignKey("users.id", ondelete="cascade"), nullable=False)
+    
+    amount = sa.Column(sa.Float, nullable=False)
+    
+    payment_method = sa.Column(sa.String(256), nullable=False)
+
+    number_upgraded_account = sa.Column(sa.Integer, nullable=False)
+
+    comment = sa.Column(sa.Text)
+
+    user = orm.relationship(User)
+
+class IgnoredEmail(Base, ModelMixin):
+
+    __tablename__ = "ignored_email"
+
+    mail_from = sa.Column(sa.String(512), nullable=False)
+    rcpt_to = sa.Column(sa.String(512), nullable=False)
+
+
+class IgnoreBounceSender(Base, ModelMixin):
+
+    __tablename__ = "ignore_bounce_sender"
+
+    mail_from = sa.Column(sa.String(512), nullable=False, unique=True)
+
+    def __repr__(self):
+        return f"<NoReplySender {self.mail_from}"
