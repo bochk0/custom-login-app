@@ -1419,21 +1419,6 @@ class Alias(Base, ModelMixin):
 
         return ret
 
-    def authorized_addresses(self) -> [str]:
-        mailboxes = self.mailboxes
-        ret = [mb.email for mb in mailboxes]
-        for mailbox in mailboxes:
-            for aa in mailbox.authorized_addresses:
-                ret.append(aa.email)
-
-        return ret
-
-    def mailbox_support_pgp(self) -> bool:
-        """return True of one of the mailboxes support PGP"""
-        for mb in self.mailboxes:
-            if mb.pgp_enabled():
-                return True
-        return False
 
     def pgp_enabled(self) -> bool:
         if self.mailbox_support_pgp() and not self.disable_pgp:
@@ -2595,3 +2580,205 @@ class SentAlert(Base, ModelMixin):
     user_id = sa.Column(sa.ForeignKey(User.id, ondelete="cascade"), nullable=False)
     to_email = sa.Column(sa.String(256), nullable=False)
     alert_type = sa.Column(sa.String(256), nullable=False)
+
+
+class AliasMailbox(Base, ModelMixin):
+    __tablename__ = "alias_mailbox"
+    __table_args__ = (
+        sa.UniqueConstraint("alias_id", "mailbox_id", name="uq_alias_mailbox"),
+    )
+
+    alias_id = sa.Column(
+        sa.ForeignKey(Alias.id, ondelete="cascade"), nullable=False, index=True
+    )
+    mailbox_id = sa.Column(
+        sa.ForeignKey(Mailbox.id, ondelete="cascade"), nullable=False, index=True
+    )
+
+    alias = orm.relationship(Alias)
+
+
+class AliasHibp(Base, ModelMixin):
+    __tablename__ = "alias_hibp"
+
+    __table_args__ = (sa.UniqueConstraint("alias_id", "hibp_id", name="uq_alias_hibp"),)
+
+    alias_id = sa.Column(
+        sa.Integer(), sa.ForeignKey("alias.id", ondelete="cascade"), index=True
+    )
+    hibp_id = sa.Column(
+        sa.Integer(), sa.ForeignKey("hibp.id", ondelete="cascade"), index=True
+    )
+
+    alias = orm.relationship(
+        "Alias", backref=orm.backref("alias_hibp", cascade="all, delete-orphan")
+    )
+    hibp = orm.relationship(
+        "Hibp", backref=orm.backref("alias_hibp", cascade="all, delete-orphan")
+    )
+
+
+class DirectoryMailbox(Base, ModelMixin):
+    __tablename__ = "directory_mailbox"
+    __table_args__ = (
+        sa.UniqueConstraint("directory_id", "mailbox_id", name="uq_directory_mailbox"),
+    )
+
+    directory_id = sa.Column(
+        sa.ForeignKey(Directory.id, ondelete="cascade"), nullable=False
+    )
+    mailbox_id = sa.Column(
+        sa.ForeignKey(Mailbox.id, ondelete="cascade"), nullable=False
+    )
+
+
+class DomainMailbox(Base, ModelMixin):
+    """store the owning mailboxes for a domain"""
+
+    __tablename__ = "domain_mailbox"
+
+    __table_args__ = (
+        sa.UniqueConstraint("domain_id", "mailbox_id", name="uq_domain_mailbox"),
+    )
+
+    domain_id = sa.Column(
+        sa.ForeignKey(CustomDomain.id, ondelete="cascade"), nullable=False
+    )
+    mailbox_id = sa.Column(
+        sa.ForeignKey(Mailbox.id, ondelete="cascade"), nullable=False
+    )
+
+
+_NB_RECOVERY_CODE = 8
+_RECOVERY_CODE_LENGTH = 8
+
+
+class RecoveryCode(Base, ModelMixin):
+    """allow user to login in case you lose any of your authenticators"""
+
+    __tablename__ = "recovery_code"
+    __table_args__ = (sa.UniqueConstraint("user_id", "code", name="uq_recovery_code"),)
+
+    user_id = sa.Column(sa.ForeignKey(User.id, ondelete="cascade"), nullable=False)
+    code = sa.Column(sa.String(64), nullable=False)
+    used = sa.Column(sa.Boolean, nullable=False, default=False)
+    used_at = sa.Column(ArrowType, nullable=True, default=None)
+
+    user = orm.relationship(User)
+
+    @classmethod
+    def _hash_code(cls, code: str) -> str:
+        code_hmac = hmac.new(
+            config.RECOVERY_CODE_HMAC_SECRET.encode("utf-8"),
+            code.encode("utf-8"),
+            "sha3_224",
+        )
+        return base64.urlsafe_b64encode(code_hmac.digest()).decode("utf-8").rstrip("=")
+
+    @classmethod
+    def generate(cls, user):
+        """generate recovery codes for user"""
+        
+        cls.filter_by(user_id=user.id).delete()
+        Session.flush()
+
+        nb_code = 0
+        raw_codes = []
+        while nb_code < _NB_RECOVERY_CODE:
+            raw_code = random_string(_RECOVERY_CODE_LENGTH)
+            encoded_code = cls._hash_code(raw_code)
+            if not cls.get_by(user_id=user.id, code=encoded_code):
+                cls.create(user_id=user.id, code=encoded_code)
+                raw_codes.append(raw_code)
+                nb_code += 1
+
+        LOG.d("Create recovery codes for %s", user)
+        Session.commit()
+        return raw_codes
+
+    @classmethod
+    def find_by_user_code(cls, user: User, code: str):
+        hashed_code = cls._hash_code(code)
+        return cls.get_by(user_id=user.id, code=hashed_code)
+
+    @classmethod
+    def empty(cls, user):
+        """Delete all recovery codes for user"""
+        cls.filter_by(user_id=user.id).delete()
+        Session.commit()
+
+
+class Notification(Base, ModelMixin):
+    __tablename__ = "notification"
+    user_id = sa.Column(
+        sa.ForeignKey(User.id, ondelete="cascade"), nullable=False, index=True
+    )
+    message = sa.Column(sa.Text, nullable=False)
+    title = sa.Column(sa.String(512))
+
+    
+    read = sa.Column(sa.Boolean, nullable=False, default=False)
+
+    @staticmethod
+    def render(template_name, **kwargs) -> str:
+        templates_dir = os.path.join(config.ROOT_DIR, "templates")
+        env = Environment(loader=FileSystemLoader(templates_dir))
+
+        template = env.get_template(template_name)
+
+        return template.render(
+            URL=config.URL,
+            LANDING_PAGE_URL=config.LANDING_PAGE_URL,
+            YEAR=arrow.now().year,
+            **kwargs,
+        )
+
+
+class Partner(Base, ModelMixin):
+    __tablename__ = "partner"
+
+    name = sa.Column(sa.String(128), unique=True, nullable=False)
+    contact_email = sa.Column(sa.String(128), unique=True, nullable=False)
+
+    @staticmethod
+    def find_by_token(token: str) -> Optional[Partner]:
+        hmaced = PartnerApiToken.hmac_token(token)
+        res = (
+            Session.query(Partner, PartnerApiToken)
+            .filter(
+                and_(
+                    PartnerApiToken.token == hmaced,
+                    Partner.id == PartnerApiToken.partner_id,
+                )
+            )
+            .first()
+        )
+        if res:
+            partner, partner_api_token = res
+            return partner
+        return None
+
+
+class SLDomain(Base, ModelMixin):
+    """Login domains"""
+
+    __tablename__ = "public_domain"
+
+    domain = sa.Column(sa.String(128), unique=True, nullable=False)
+
+    
+    premium_only = sa.Column(
+        sa.Boolean, nullable=False, default=False, server_default="0"
+    )
+
+    
+    can_use_subdomain = sa.Column(
+        sa.Boolean, nullable=False, default=False, server_default="0"
+    )
+
+    partner_id = sa.Column(
+        sa.ForeignKey(Partner.id, ondelete="cascade"),
+        nullable=True,
+        default=None,
+        server_default="NULL",
+    )
