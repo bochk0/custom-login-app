@@ -725,18 +725,9 @@ class User(Base, ModelMixin, UserMixin, PasswordOracle):
             channels.append(f" Subscription {_sub.expires_date.humanize()}")
 
         manual_sub: ManualSubscription = ManualSubscription.get_by(user_id=self.id)
-        if manual_sub and manual_sub.is_active():
-            mode = "Giveaway" if manual_sub.is_giveaway else "Paid"
-            channels.append(
-                f"Manual Subscription {manual_sub.comment} {mode} {manual_sub.end_at.humanize()}"
-            )
 
-        coinbase_subscription: CoinbaseSubscription = CoinbaseSubscription.get_by(
-            user_id=self.id
-        )
         return ".\n".join(channels)
 
-    
 
     def max_alias_for_free_account(self) -> int:
         if (
@@ -1255,3 +1246,208 @@ class RedirectUri(Base, ModelMixin):
     uri = sa.Column(sa.String(1024), nullable=False)
 
     client = orm.relationship(Client, backref="redirect_uris")
+
+    class AuthorizationCode(Base, ModelMixin):
+    __tablename__ = "authorization_code"
+
+    code = sa.Column(sa.String(128), unique=True, nullable=False)
+    client_id = sa.Column(sa.ForeignKey(Client.id, ondelete="cascade"), nullable=False)
+    user_id = sa.Column(sa.ForeignKey(User.id, ondelete="cascade"), nullable=False)
+
+    scope = sa.Column(sa.String(128))
+    redirect_uri = sa.Column(sa.String(1024))
+
+    
+    response_type = sa.Column(sa.String(128))
+
+    nonce = sa.Column(sa.Text, nullable=True, default=None, server_default=text("NULL"))
+
+    user = orm.relationship(User, lazy=False)
+    client = orm.relationship(Client, lazy=False)
+
+    expired = sa.Column(ArrowType, nullable=False, default=_expiration_5m)
+
+    def is_expired(self):
+        return self.expired < arrow.now()
+
+
+class OauthToken(Base, ModelMixin):
+    __tablename__ = "oauth_token"
+
+    access_token = sa.Column(sa.String(128), unique=True)
+    client_id = sa.Column(sa.ForeignKey(Client.id, ondelete="cascade"), nullable=False)
+    user_id = sa.Column(sa.ForeignKey(User.id, ondelete="cascade"), nullable=False)
+
+    scope = sa.Column(sa.String(128))
+    redirect_uri = sa.Column(sa.String(1024))
+
+    
+    response_type = sa.Column(sa.String(128))
+
+    user = orm.relationship(User)
+    client = orm.relationship(Client)
+
+    expired = sa.Column(ArrowType, nullable=False, default=_expiration_1h)
+
+    def is_expired(self):
+        return self.expired < arrow.now()
+
+
+def available_sl_email(email: str) -> bool:
+    if (
+        Alias.get_by(email=email)
+        or Contact.get_by(reply_email=email)
+        or DeletedAlias.get_by(email=email)
+    ):
+        return False
+    return True
+
+
+def generate_random_alias_email(
+    scheme: int = AliasGeneratorEnum.word.value,
+    in_hex: bool = False,
+    alias_domain: str = config.FIRST_ALIAS_DOMAIN,
+    retries: int = 10,
+) -> str:
+
+    if retries <= 0:
+        raise Exception("Cannot generate alias after many retries")
+    if scheme == AliasGeneratorEnum.uuid.value:
+        name = uuid.uuid4().hex if in_hex else uuid.uuid4().__str__()
+        random_email = name + "@" + alias_domain
+    else:
+        random_email = random_words(2, 3) + "@" + alias_domain
+
+    random_email = random_email.lower().strip()
+
+    
+    if available_sl_email(random_email):
+        LOG.d("generate email %s", random_email)
+        return random_email
+
+    
+    LOG.w("email %s already exists, generate a new email", random_email)
+    return generate_random_alias_email(
+        scheme=scheme, in_hex=in_hex, retries=retries - 1
+    )
+
+
+class Alias(Base, ModelMixin):
+    __tablename__ = "alias"
+
+    FLAG_PARTNER_CREATED = 1 << 0
+
+    user_id = sa.Column(
+        sa.ForeignKey(User.id, ondelete="cascade"), nullable=False, index=True
+    )
+    email = sa.Column(sa.String(128), unique=True, nullable=False)
+
+    
+    name = sa.Column(sa.String(128), nullable=True, default=None)
+
+    enabled = sa.Column(sa.Boolean(), default=True, nullable=False)
+    flags = sa.Column(
+        sa.BigInteger(), default=0, server_default="0", nullable=False, index=True
+    )
+
+    custom_domain_id = sa.Column(
+        sa.ForeignKey("custom_domain.id", ondelete="cascade"), nullable=True, index=True
+    )
+
+    custom_domain = orm.relationship("CustomDomain", foreign_keys=[custom_domain_id])
+
+    
+    automatic_creation = sa.Column(
+        sa.Boolean, nullable=False, default=False, server_default="0"
+    )
+
+    
+    directory_id = sa.Column(
+        sa.ForeignKey("directory.id", ondelete="cascade"), nullable=True, index=True
+    )
+
+    note = sa.Column(sa.Text, default=None, nullable=True)
+
+    
+    mailbox_id = sa.Column(
+        sa.ForeignKey("mailbox.id", ondelete="cascade"), nullable=False, index=True
+    )
+
+    
+    
+    _mailboxes = orm.relationship("Mailbox", secondary="alias_mailbox", lazy="joined")
+
+    
+    
+    disable_pgp = sa.Column(
+        sa.Boolean, nullable=False, default=False, server_default="0"
+    )
+
+    
+    cannot_be_disabled = sa.Column(
+        sa.Boolean, nullable=False, default=False, server_default="0"
+    )
+
+    
+    disable_email_spoofing_check = sa.Column(
+        sa.Boolean, nullable=False, default=False, server_default="0"
+    )
+
+    
+    batch_import_id = sa.Column(
+        sa.ForeignKey("batch_import.id", ondelete="SET NULL"),
+        nullable=True,
+        default=None,
+    )
+
+    
+    original_owner_id = sa.Column(
+        sa.ForeignKey(User.id, ondelete="SET NULL"), nullable=True
+    )
+
+    
+    pinned = sa.Column(sa.Boolean, nullable=False, default=False, server_default="0")
+
+    
+    transfer_token = sa.Column(sa.String(64), default=None, unique=True, nullable=True)
+    transfer_token_expiration = sa.Column(
+        ArrowType, default=arrow.utcnow, nullable=True
+    )
+
+    
+    hibp_last_check = sa.Column(ArrowType, default=None, index=True)
+    hibp_breaches = orm.relationship("Hibp", secondary="alias_hibp")
+
+    
+    
+    ts_vector = sa.Column(
+        TSVector(), sa.Computed("to_tsvector('english', note)", persisted=True)
+    )
+
+    last_email_log_id = sa.Column(sa.Integer, default=None, nullable=True)
+
+    __table_args__ = (
+        Index("ix_video___ts_vector__", ts_vector, postgresql_using="gin"),
+        
+        Index(
+            "note_pg_trgm_index",
+            "note",
+            postgresql_ops={"note": "gin_trgm_ops"},
+            postgresql_using="gin",
+        ),
+    )
+
+    user = orm.relationship(User, foreign_keys=[user_id])
+    mailbox = orm.relationship("Mailbox", lazy="joined")
+
+    @property
+    def mailboxes(self):
+        ret = [self.mailbox]
+        for m in self._mailboxes:
+            if m.id is not self.mailbox.id:
+                ret.append(m)
+
+        ret = [mb for mb in ret if mb.verified]
+        ret = sorted(ret, key=lambda mb: mb.email)
+
+        return ret
