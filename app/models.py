@@ -630,19 +630,6 @@ class User(Base, ModelMixin, UserMixin, PasswordOracle):
 
         def get_active_subscription_end(
         self, include_partner_subscription: bool = True
-    ) -> Optional[arrow.Arrow]:
-        sub = self.get_active_subscription(
-            include_partner_subscription=include_partner_subscription
-        )
-        if isinstance(sub, Subscription):
-            return arrow.get(sub.next_bill_date)
-        if isinstance(sub, Subscription):
-            return sub.expires_date
-        if isinstance(sub, ManualSubscription):
-            return sub.end_at
-        if isinstance(sub, CoinbaseSubscription):
-            return sub.end_at
-        return None
 
     
     def lifetime_or_active_subscription(
@@ -1451,3 +1438,222 @@ class Alias(Base, ModelMixin):
         ret = sorted(ret, key=lambda mb: mb.email)
 
         return ret
+
+    def authorized_addresses(self) -> [str]:
+        mailboxes = self.mailboxes
+        ret = [mb.email for mb in mailboxes]
+        for mailbox in mailboxes:
+            for aa in mailbox.authorized_addresses:
+                ret.append(aa.email)
+
+        return ret
+
+    def mailbox_support_pgp(self) -> bool:
+        """return True of one of the mailboxes support PGP"""
+        for mb in self.mailboxes:
+            if mb.pgp_enabled():
+                return True
+        return False
+
+    def pgp_enabled(self) -> bool:
+        if self.mailbox_support_pgp() and not self.disable_pgp:
+            return True
+        return False
+
+    @staticmethod
+    def get_custom_domain(alias_address) -> Optional["CustomDomain"]:
+        alias_domain = validate_email(
+            alias_address, check_deliverability=False, allow_smtputf8=False
+        ).domain
+
+        
+        if SLDomain.get_by(domain=alias_domain) is None:
+            custom_domain = CustomDomain.get_by(domain=alias_domain)
+            if custom_domain:
+                return custom_domain
+
+    @classmethod
+    def create(cls, **kw):
+        commit = kw.pop("commit", False)
+        flush = kw.pop("flush", False)
+
+        new_alias = cls(**kw)
+        user = User.get(new_alias.user_id)
+        if user.is_premium():
+            limits = config.ALIAS_CREATE_RATE_LIMIT_PAID
+        else:
+            limits = config.ALIAS_CREATE_RATE_LIMIT_FREE
+        
+        for limit in limits:
+            key = f"alias_create_{limit[1]}d:{user.id}"
+            rate_limiter.check_bucket_limit(key, limit[0], limit[1])
+
+        email = kw["email"]
+        
+        email = sanitize_email(email)
+
+        
+        if DeletedAlias.get_by(email=email):
+            raise AliasInTrashError
+
+        if DomainDeletedAlias.get_by(email=email):
+            raise AliasInTrashError
+
+        
+        if "custom_domain_id" not in kw:
+            custom_domain = Alias.get_custom_domain(email)
+            if custom_domain:
+                new_alias.custom_domain_id = custom_domain.id
+
+        Session.add(new_alias)
+        DailyMetric.get_or_create_today_metric().nb_alias += 1
+
+        
+        from app.events.event_dispatcher import EventDispatcher
+        from app.events.generated.event_pb2 import AliasCreated, EventContent
+
+        event = AliasCreated(
+            alias_id=new_alias.id,
+            alias_email=new_alias.email,
+            alias_note=new_alias.note,
+            enabled=True,
+        )
+        EventDispatcher.send_event(user, EventContent(alias_created=event))
+
+        if (
+            new_alias.flags & cls.FLAG_PARTNER_CREATED > 0
+            and new_alias.user.flags & User.FLAG_CREATED_ALIAS_FROM_PARTNER == 0
+        ):
+            user.flags = user.flags | User.FLAG_CREATED_ALIAS_FROM_PARTNER
+
+        if commit:
+            Session.commit()
+
+        if flush:
+            Session.flush()
+
+        return new_alias
+
+    @classmethod
+    def create_new(cls, user, prefix, note=None, mailbox_id=None):
+        prefix = prefix.lower().strip().replace(" ", "")
+
+        if not prefix:
+            raise Exception("alias prefix cannot be empty")
+
+        
+        for _ in range(1000):
+            suffix = user.get_random_alias_suffix()
+            email = f"{prefix}.{suffix}@{config.FIRST_ALIAS_DOMAIN}"
+
+            if available_sl_email(email):
+                break
+
+        return Alias.create(
+            user_id=user.id,
+            email=email,
+            note=note,
+            mailbox_id=mailbox_id or user.default_mailbox_id,
+        )
+
+        @classmethod
+    def delete(cls, obj_id):
+        raise Exception("should use delete_alias(alias,user) instead")
+
+    @classmethod
+    def create_new_random(
+        cls,
+        user,
+        scheme: int = AliasGeneratorEnum.word.value,
+        in_hex: bool = False,
+        note: str = None,
+    ):
+        """create a new random alias"""
+        custom_domain = None
+
+        random_email = None
+
+        if user.default_alias_custom_domain_id:
+            custom_domain = CustomDomain.get(user.default_alias_custom_domain_id)
+            random_email = generate_random_alias_email(
+                scheme=scheme, in_hex=in_hex, alias_domain=custom_domain.domain
+            )
+        elif user.default_alias_public_domain_id:
+            sl_domain: SLDomain = SLDomain.get(user.default_alias_public_domain_id)
+            if sl_domain.premium_only and not user.is_premium():
+                LOG.w("%s not premium, cannot use %s", user, sl_domain)
+            else:
+                random_email = generate_random_alias_email(
+                    scheme=scheme, in_hex=in_hex, alias_domain=sl_domain.domain
+                )
+
+        if not random_email:
+            random_email = generate_random_alias_email(scheme=scheme, in_hex=in_hex)
+
+        alias = Alias.create(
+            user_id=user.id,
+            email=random_email,
+            mailbox_id=user.default_mailbox_id,
+            note=note,
+        )
+
+        if custom_domain:
+            alias.custom_domain_id = custom_domain.id
+
+        return alias
+
+    def mailbox_email(self):
+        if self.mailbox_id:
+            return self.mailbox.email
+        else:
+            return self.user.email
+
+    def __repr__(self):
+        return f"<Alias {self.id} {self.email}>"
+
+
+class ClientUser(Base, ModelMixin):
+    __tablename__ = "client_user"
+    __table_args__ = (
+        sa.UniqueConstraint("user_id", "client_id", name="uq_client_user"),
+    )
+
+    user_id = sa.Column(sa.ForeignKey(User.id, ondelete="cascade"), nullable=False)
+    client_id = sa.Column(sa.ForeignKey(Client.id, ondelete="cascade"), nullable=False)
+
+    
+    alias_id = sa.Column(
+        sa.ForeignKey(Alias.id, ondelete="cascade"), nullable=True, index=True
+    )
+
+    
+    name = sa.Column(
+        sa.String(128), nullable=True, default=None, server_default=text("NULL")
+    )
+
+    
+    default_avatar = sa.Column(
+        sa.Boolean, nullable=False, default=False, server_default="0"
+    )
+
+    alias = orm.relationship(Alias, backref="client_users")
+
+    user = orm.relationship(User)
+    client = orm.relationship(Client)
+
+    def get_email(self):
+        return self.alias.email if self.alias_id else self.user.email
+
+    def get_user_name(self):
+        if self.name:
+            return self.name
+        else:
+            return self.user.name
+
+    def get_user_info(self) -> dict:
+        res = {
+            "id": self.id,
+            "client": self.client.name,
+            "email_verified": True,
+            "sub": str(self.id),
+        }
