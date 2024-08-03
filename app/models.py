@@ -626,27 +626,6 @@ class User(Base, ModelMixin, UserMixin, PasswordOracle):
         if sub:
             return sub
 
-        apple_sub: AppleSubscription = AppleSubscription.get_by(user_id=self.id)
-        if apple_sub and apple_sub.is_valid():
-            return apple_sub
-
-        manual_sub: ManualSubscription = ManualSubscription.get_by(user_id=self.id)
-        if manual_sub and manual_sub.is_active():
-            return manual_sub
-
-        coinbase_subscription: CoinbaseSubscription = CoinbaseSubscription.get_by(
-            user_id=self.id
-        )
-        if coinbase_subscription and coinbase_subscription.is_active():
-            return coinbase_subscription
-
-        if include_partner_subscription:
-            partner_sub: PartnerSubscription = PartnerSubscription.find_by_user_id(
-                self.id
-            )
-            if partner_sub and partner_sub.is_active():
-                return partner_sub
-
         return None
 
         def get_active_subscription_end(
@@ -1053,3 +1032,226 @@ class User(Base, ModelMixin, UserMixin, PasswordOracle):
             + Client.filter(Client.user_id == self.id).count()
             > 0
         )
+
+    def get_random_alias_suffix(self, custom_domain: Optional["CustomDomain"] = None):
+        """Get random suffix for an alias based on user's preference.
+
+        Use a shorter suffix in case of custom domain
+
+        Returns:
+            str: the random suffix generated
+        """
+        if self.random_alias_suffix == AliasSuffixEnum.random_string.value:
+            return random_string(config.ALIAS_RANDOM_SUFFIX_LENGTH, include_digits=True)
+
+        if custom_domain is None:
+            return random_words(1, 3)
+
+        return random_words(1)
+
+    def can_create_contacts(self) -> bool:
+        if self.is_premium():
+            return True
+        if self.flags & User.FLAG_FREE_DISABLE_CREATE_ALIAS == 0:
+            return True
+        return not config.DISABLE_CREATE_CONTACTS_FOR_FREE_USERS
+
+    def has_used_alias_from_partner(self) -> bool:
+        return (
+            self.flags
+            & (User.FLAG_CREATED_ALIAS_FROM_PARTNER | User.FLAG_CREATED_FROM_PARTNER)
+            > 0
+        )
+
+    def __repr__(self):
+        return f"<User {self.id} {self.name} {self.email}>"
+
+
+def _expiration_1h():
+    return arrow.now().shift(hours=1)
+
+
+def _expiration_12h():
+    return arrow.now().shift(hours=12)
+
+
+def _expiration_5m():
+    return arrow.now().shift(minutes=5)
+
+
+def _expiration_7d():
+    return arrow.now().shift(days=7)
+
+
+class ActivationCode(Base, ModelMixin):
+    """For activate user account"""
+
+    __tablename__ = "activation_code"
+
+    user_id = sa.Column(sa.ForeignKey(User.id, ondelete="cascade"), nullable=False)
+    code = sa.Column(sa.String(128), unique=True, nullable=False)
+
+    user = orm.relationship(User)
+
+    expired = sa.Column(ArrowType, nullable=False, default=_expiration_1h)
+
+    def is_expired(self):
+        return self.expired < arrow.now()
+
+
+class ResetPasswordCode(Base, ModelMixin):
+    """For resetting password"""
+
+    __tablename__ = "reset_password_code"
+
+    user_id = sa.Column(sa.ForeignKey(User.id, ondelete="cascade"), nullable=False)
+    code = sa.Column(sa.String(128), unique=True, nullable=False)
+
+    user = orm.relationship(User)
+
+    expired = sa.Column(ArrowType, nullable=False, default=_expiration_1h)
+
+    def is_expired(self):
+        return self.expired < arrow.now()
+
+
+class SocialAuth(Base, ModelMixin):
+    """Store how user authenticates with social login"""
+
+    __tablename__ = "social_auth"
+
+    user_id = sa.Column(sa.ForeignKey(User.id, ondelete="cascade"), nullable=False)
+
+    
+    social = sa.Column(sa.String(128), nullable=False)
+
+    __table_args__ = (sa.UniqueConstraint("user_id", "social", name="uq_social_auth"),)
+
+
+def generate_oauth_client_id(client_name) -> str:
+    oauth_client_id = convert_to_id(client_name) + "-" + random_string()
+
+    
+    if not Client.get_by(oauth_client_id=oauth_client_id):
+        LOG.d("generate oauth_client_id %s", oauth_client_id)
+        return oauth_client_id
+
+    
+    LOG.w("client_id %s already exists, generate a new client_id", oauth_client_id)
+    return generate_oauth_client_id(client_name)
+
+
+class MfaBrowser(Base, ModelMixin):
+    __tablename__ = "mfa_browser"
+
+    user_id = sa.Column(sa.ForeignKey(User.id, ondelete="cascade"), nullable=False)
+    token = sa.Column(sa.String(64), default=False, unique=True, nullable=False)
+    expires = sa.Column(ArrowType, default=False, nullable=False)
+
+    user = orm.relationship(User)
+
+    @classmethod
+    def create_new(cls, user, token_length=64) -> "MfaBrowser":
+        found = False
+        while not found:
+            token = random_string(token_length)
+
+            if not cls.get_by(token=token):
+                found = True
+
+        return MfaBrowser.create(
+            user_id=user.id,
+            token=token,
+            expires=arrow.now().shift(days=30),
+        )
+
+    @classmethod
+    def delete(cls, token):
+        cls.filter(cls.token == token).delete()
+        Session.commit()
+
+    @classmethod
+    def delete_expired(cls):
+        cls.filter(cls.expires < arrow.now()).delete()
+        Session.commit()
+
+    def is_expired(self):
+        return self.expires < arrow.now()
+
+    def reset_expire(self):
+        self.expires = arrow.now().shift(days=30)
+
+
+class Client(Base, ModelMixin):
+    __tablename__ = "client"
+    oauth_client_id = sa.Column(sa.String(128), unique=True, nullable=False)
+    oauth_client_secret = sa.Column(sa.String(128), nullable=False)
+
+    name = sa.Column(sa.String(128), nullable=False)
+    home_url = sa.Column(sa.String(1024))
+
+    
+    user_id = sa.Column(sa.ForeignKey(User.id, ondelete="cascade"), nullable=False)
+    icon_id = sa.Column(sa.ForeignKey(File.id), nullable=True)
+
+    
+    approved = sa.Column(sa.Boolean, nullable=False, default=False, server_default="0")
+    description = sa.Column(sa.Text, nullable=True)
+
+    
+    
+    referral_id = sa.Column(
+        sa.ForeignKey("referral.id", ondelete="SET NULL"), nullable=True
+    )
+
+    icon = orm.relationship(File)
+    user = orm.relationship(User)
+    referral = orm.relationship("Referral")
+
+    def nb_user(self):
+        return ClientUser.filter_by(client_id=self.id).count()
+
+    def get_scopes(self) -> [Scope]:
+        
+        return [Scope.NAME, Scope.EMAIL, Scope.AVATAR_URL]
+
+    @classmethod
+    def create_new(cls, name, user_id) -> "Client":
+        
+        oauth_client_id = generate_oauth_client_id(name)
+        oauth_client_secret = random_string(40)
+        client = Client.create(
+            name=name,
+            oauth_client_id=oauth_client_id,
+            oauth_client_secret=oauth_client_secret,
+            user_id=user_id,
+        )
+
+        return client
+
+    def get_icon_url(self):
+        if self.icon_id:
+            return self.icon.get_url()
+        else:
+            return config.URL + "/static/default-icon.svg"
+
+    def last_user_login(self) -> "ClientUser":
+        client_user = (
+            ClientUser.filter(ClientUser.client_id == self.id)
+            .order_by(ClientUser.updated_at)
+            .first()
+        )
+        if client_user:
+            return client_user
+        return None
+
+
+class RedirectUri(Base, ModelMixin):
+    """Valid redirect uris for a client"""
+
+    __tablename__ = "redirect_uri"
+
+    client_id = sa.Column(sa.ForeignKey(Client.id, ondelete="cascade"), nullable=False)
+    uri = sa.Column(sa.String(1024), nullable=False)
+
+    client = orm.relationship(Client, backref="redirect_uris")
