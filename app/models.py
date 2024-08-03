@@ -1638,36 +1638,6 @@ class ClientUser(Base, ModelMixin):
             "sub": str(self.id),
         }
 
-for scope in self.client.get_scopes():
-            if scope == Scope.NAME:
-                if self.name:
-                    res[Scope.NAME.value] = self.name or ""
-                else:
-                    res[Scope.NAME.value] = self.user.name or ""
-            elif scope == Scope.AVATAR_URL:
-                if self.user.profile_picture_id:
-                    if self.default_avatar:
-                        res[Scope.AVATAR_URL.value] = (
-                            config.URL + "/static/default-avatar.png"
-                        )
-                    else:
-                        res[Scope.AVATAR_URL.value] = self.user.profile_picture.get_url(
-                            config.AVATAR_URL_EXPIRATION
-                        )
-                else:
-                    res[Scope.AVATAR_URL.value] = None
-            elif scope == Scope.EMAIL:
-                
-                if self.alias_id:
-                    LOG.d(
-                        "Use gen email for user %s, client %s", self.user, self.client
-                    )
-                    res[Scope.EMAIL.value] = self.alias.email
-                
-                else:
-                    res[Scope.EMAIL.value] = self.user.email
-
-        return res
 
 
 class Contact(Base, ModelMixin):
@@ -1838,3 +1808,223 @@ class Contact(Base, ModelMixin):
             .order_by(desc(EmailLog.created_at))
             .first()
         )
+
+    def __repr__(self):
+        return f"<Contact {self.id} {self.website_email} {self.alias_id}>"
+
+
+class EmailLog(Base, ModelMixin):
+    __tablename__ = "email_log"
+    __table_args__ = (Index("ix_email_log_created_at", "created_at"),)
+
+    user_id = sa.Column(
+        sa.ForeignKey(User.id, ondelete="cascade"), nullable=False, index=True
+    )
+    contact_id = sa.Column(
+        sa.ForeignKey(Contact.id, ondelete="cascade"), nullable=False, index=True
+    )
+    alias_id = sa.Column(
+        sa.ForeignKey(Alias.id, ondelete="cascade"), nullable=True, index=True
+    )
+
+    
+    is_reply = sa.Column(sa.Boolean, nullable=False, default=False)
+
+    
+    blocked = sa.Column(sa.Boolean, nullable=False, default=False)
+
+    
+    
+    bounced = sa.Column(sa.Boolean, nullable=False, default=False, server_default="0")
+
+    
+    auto_replied = sa.Column(
+        sa.Boolean, nullable=False, default=False, server_default="0"
+    )
+
+    
+    is_spam = sa.Column(sa.Boolean, nullable=False, default=False, server_default="0")
+    spam_score = sa.Column(sa.Float, nullable=True)
+    spam_status = sa.Column(sa.Text, nullable=True, default=None)
+    
+    spam_report = deferred(sa.Column(sa.JSON, nullable=True))
+
+    
+    refused_email_id = sa.Column(
+        sa.ForeignKey("refused_email.id", ondelete="SET NULL"), nullable=True
+    )
+
+    
+    
+    mailbox_id = sa.Column(
+        sa.ForeignKey("mailbox.id", ondelete="cascade"), nullable=True
+    )
+
+    
+    
+    bounced_mailbox_id = sa.Column(
+        sa.ForeignKey("mailbox.id", ondelete="cascade"), nullable=True
+    )
+
+    
+    message_id = deferred(sa.Column(sa.String(1024), nullable=True))
+    
+    sl_message_id = deferred(sa.Column(sa.String(512), nullable=True))
+
+    refused_email = orm.relationship("RefusedEmail")
+    forward = orm.relationship(Contact)
+
+    contact = orm.relationship(Contact, backref="email_logs")
+    alias = orm.relationship(Alias)
+    mailbox = orm.relationship("Mailbox", lazy="joined", foreign_keys=[mailbox_id])
+    user = orm.relationship(User)
+
+    def bounced_mailbox(self) -> str:
+        if self.bounced_mailbox_id:
+            return Mailbox.get(self.bounced_mailbox_id).email
+        
+        return self.contact.alias.mailboxes[0].email
+
+    def get_action(self) -> str:
+        """return the action name: forward|reply|block|bounced"""
+        if self.is_reply:
+            return "reply"
+        elif self.bounced:
+            return "bounced"
+        elif self.blocked:
+            return "block"
+        else:
+            return "forward"
+
+    def get_phase(self) -> str:
+        if self.is_reply:
+            return "reply"
+        else:
+            return "forward"
+
+    def get_dashboard_url(self):
+        return f"{config.URL}/dashboard/refused_email?highlight_id={self.id}"
+
+    @classmethod
+    def create(cls, *args, **kwargs):
+        commit = kwargs.pop("commit", False)
+        email_log = super().create(*args, **kwargs)
+        Session.flush()
+        if "alias_id" in kwargs:
+            sql = "UPDATE alias SET last_email_log_id = :el_id WHERE id = :alias_id"
+            Session.execute(
+                sql, {"el_id": email_log.id, "alias_id": kwargs["alias_id"]}
+            )
+        if commit:
+            Session.commit()
+        return email_log
+
+    def __repr__(self):
+        return f"<EmailLog {self.id}>"
+
+
+class Subscription(Base, ModelMixin):
+    """ subscription"""
+
+    __tablename__ = "subscription"
+
+    
+    cancel_url = sa.Column(sa.String(1024), nullable=False)
+    update_url = sa.Column(sa.String(1024), nullable=False)
+    subscription_id = sa.Column(sa.String(1024), nullable=False, unique=True)
+    event_time = sa.Column(ArrowType, nullable=False)
+    next_bill_date = sa.Column(sa.Date, nullable=False)
+
+    cancelled = sa.Column(sa.Boolean, nullable=False, default=False)
+
+    plan = sa.Column(sa.Enum(PlanEnum), nullable=False)
+
+    user_id = sa.Column(
+        sa.ForeignKey(User.id, ondelete="cascade"), nullable=False, unique=True
+    )
+
+    user = orm.relationship(User)
+
+    def plan_name(self):
+        if self.plan == PlanEnum.monthly:
+            return "Monthly"
+        else:
+            return "Yearly"
+
+    def __repr__(self):
+        return f"<Subscription {self.plan} {self.next_bill_date}>"
+
+
+class ManualSubscription(Base, ModelMixin):
+
+
+    __tablename__ = "manual_subscription"
+
+    user_id = sa.Column(
+        sa.ForeignKey(User.id, ondelete="cascade"), nullable=False, unique=True
+    )
+
+    
+    end_at = sa.Column(ArrowType, nullable=False)
+
+    
+    comment = sa.Column(sa.Text, nullable=True)
+
+    
+    is_giveaway = sa.Column(
+        sa.Boolean, default=False, nullable=False, server_default="0"
+    )
+
+    user = orm.relationship(User)
+
+    def is_active(self):
+        return self.end_at > arrow.now()
+
+
+class CoinbaseSubscription(Base, ModelMixin):
+
+
+    __tablename__ = "coinbase_subscription"
+
+    user_id = sa.Column(
+        sa.ForeignKey(User.id, ondelete="cascade"), nullable=False, unique=True
+    )
+
+    
+    end_at = sa.Column(ArrowType, nullable=False)
+
+    
+    code = sa.Column(sa.String(64), nullable=True)
+
+    user = orm.relationship(User)
+
+    def is_active(self):
+        return self.end_at > arrow.now()
+
+__GRACE_PERIOD_DAYS = 16
+
+
+class Subscription(Base, ModelMixin):
+
+    __tablename__ = "_subscription"
+
+    user_id = sa.Column(
+        sa.ForeignKey(User.id, ondelete="cascade"), nullable=False, unique=True
+    )
+
+    expires_date = sa.Column(ArrowType, nullable=False)
+
+    
+    original_transaction_id = sa.Column(sa.String(256), nullable=False, unique=True)
+    receipt_data = sa.Column(sa.Text(), nullable=False)
+
+    plan = sa.Column(sa.Enum(PlanEnum), nullable=False)
+
+    
+    
+    product_id = sa.Column(sa.String(256), nullable=True)
+
+    user = orm.relationship(User)
+
+    def is_valid(self):
+        return self.expires_date > arrow.now().shift(days=-__GRACE_PERIOD_DAYS)
