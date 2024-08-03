@@ -1981,29 +1981,6 @@ class ManualSubscription(Base, ModelMixin):
         return self.end_at > arrow.now()
 
 
-class CoinbaseSubscription(Base, ModelMixin):
-
-
-    __tablename__ = "coinbase_subscription"
-
-    user_id = sa.Column(
-        sa.ForeignKey(User.id, ondelete="cascade"), nullable=False, unique=True
-    )
-
-    
-    end_at = sa.Column(ArrowType, nullable=False)
-
-    
-    code = sa.Column(sa.String(64), nullable=True)
-
-    user = orm.relationship(User)
-
-    def is_active(self):
-        return self.end_at > arrow.now()
-
-__GRACE_PERIOD_DAYS = 16
-
-
 class Subscription(Base, ModelMixin):
 
     __tablename__ = "_subscription"
@@ -2028,3 +2005,209 @@ class Subscription(Base, ModelMixin):
 
     def is_valid(self):
         return self.expires_date > arrow.now().shift(days=-__GRACE_PERIOD_DAYS)
+
+
+    class DeletedAlias(Base, ModelMixin):
+    """Store all deleted alias to make sure they are NOT reused"""
+
+    __tablename__ = "deleted_alias"
+
+    email = sa.Column(sa.String(256), unique=True, nullable=False)
+    reason = sa.Column(
+        IntEnumType(AliasDeleteReason),
+        nullable=False,
+        default=AliasDeleteReason.Unspecified,
+        server_default=str(AliasDeleteReason.Unspecified.value),
+    )
+
+    @classmethod
+    def create(cls, **kw):
+        raise Exception("should use delete_alias(alias,user) instead")
+
+    def __repr__(self):
+        return f"<Deleted Alias {self.email}>"
+
+
+class EmailChange(Base, ModelMixin):
+    """Used when user wants to update their email"""
+
+    __tablename__ = "email_change"
+
+    user_id = sa.Column(
+        sa.ForeignKey(User.id, ondelete="cascade"),
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    new_email = sa.Column(sa.String(256), unique=True, nullable=False)
+    code = sa.Column(sa.String(128), unique=True, nullable=False)
+    expired = sa.Column(ArrowType, nullable=False, default=_expiration_12h)
+
+    user = orm.relationship(User)
+
+    def is_expired(self):
+        return self.expired < arrow.now()
+
+    def __repr__(self):
+        return f"<EmailChange {self.id} {self.new_email} {self.user_id}>"
+
+
+class AliasUsedOn(Base, ModelMixin):
+    """Used to know where an alias is created"""
+
+    __tablename__ = "alias_used_on"
+
+    __table_args__ = (
+        sa.UniqueConstraint("alias_id", "hostname", name="uq_alias_used"),
+    )
+
+    alias_id = sa.Column(
+        sa.ForeignKey(Alias.id, ondelete="cascade"), nullable=False, index=True
+    )
+    user_id = sa.Column(sa.ForeignKey(User.id, ondelete="cascade"), nullable=False)
+
+    alias = orm.relationship(Alias)
+
+    hostname = sa.Column(sa.String(1024), nullable=False)
+
+
+class ApiKey(Base, ModelMixin):
+    """used in browser extension to identify user"""
+
+    __tablename__ = "api_key"
+
+    user_id = sa.Column(sa.ForeignKey(User.id, ondelete="cascade"), nullable=False)
+    code = sa.Column(sa.String(128), unique=True, nullable=False)
+    name = sa.Column(sa.String(128), nullable=True)
+    last_used = sa.Column(ArrowType, default=None)
+    times = sa.Column(sa.Integer, default=0, nullable=False)
+    sudo_mode_at = sa.Column(ArrowType, default=None)
+
+    user = orm.relationship(User)
+
+    @classmethod
+    def create(cls, user_id, name=None, **kwargs):
+        code = random_string(60)
+        if cls.get_by(code=code):
+            code = str(uuid.uuid4())
+
+        return super().create(user_id=user_id, name=name, code=code, **kwargs)
+
+    @classmethod
+    def delete_all(cls, user_id):
+        Session.query(cls).filter(cls.user_id == user_id).delete()
+
+
+class CustomDomain(Base, ModelMixin):
+    __tablename__ = "custom_domain"
+
+    user_id = sa.Column(sa.ForeignKey(User.id, ondelete="cascade"), nullable=False)
+    domain = sa.Column(sa.String(128), unique=True, nullable=False)
+
+    
+    name = sa.Column(sa.String(128), nullable=True, default=None)
+
+    
+    verified = sa.Column(sa.Boolean, nullable=False, default=False)
+    dkim_verified = sa.Column(
+        sa.Boolean, nullable=False, default=False, server_default="0"
+    )
+    spf_verified = sa.Column(
+        sa.Boolean, nullable=False, default=False, server_default="0"
+    )
+    dmarc_verified = sa.Column(
+        sa.Boolean, nullable=False, default=False, server_default="0"
+    )
+
+    _mailboxes = orm.relationship("Mailbox", secondary="domain_mailbox", lazy="joined")
+
+    
+    catch_all = sa.Column(sa.Boolean, nullable=False, default=False, server_default="0")
+
+    
+    random_prefix_generation = sa.Column(
+        sa.Boolean, nullable=False, default=False, server_default="0"
+    )
+    
+    nb_failed_checks = sa.Column(
+        sa.Integer, default=0, server_default="0", nullable=False
+    )
+
+    
+    ownership_verified = sa.Column(
+        sa.Boolean, nullable=False, default=False, server_default="0"
+    )    
+    
+    ownership_txt_token = sa.Column(sa.String(128), nullable=True)
+
+    
+    is_sl_subdomain = sa.Column(
+        sa.Boolean, nullable=False, default=False, server_default="0"
+    )
+
+    __table_args__ = (
+        Index(
+            "ix_unique_domain",  
+            "domain",  
+            unique=True,
+            postgresql_where=Column("ownership_verified"),
+        ),  
+    )
+
+    user = orm.relationship(User, foreign_keys=[user_id], backref="custom_domains")
+
+    @property
+    def mailboxes(self):
+        if self._mailboxes:
+            return self._mailboxes
+        else:
+            return [self.user.default_mailbox]
+
+    def nb_alias(self):
+        return Alias.filter_by(custom_domain_id=self.id).count()
+
+    def get_trash_url(self):
+        return config.URL + f"/dashboard/domains/{self.id}/trash"
+
+    def get_ownership_dns_txt_value(self):
+        return f"sl-verification={self.ownership_txt_token}"
+
+    @classmethod
+    def create(cls, **kwargs):
+        domain = kwargs.get("domain")
+        kwargs["domain"] = domain.replace("\n", "")
+        if DeletedSubdomain.get_by(domain=domain):
+            raise SubdomainInTrashError
+
+        domain: CustomDomain = super(CustomDomain, cls).create(**kwargs)
+
+        
+        if not domain.ownership_txt_token:
+            domain.ownership_txt_token = random_string(30)
+            Session.commit()
+
+        if domain.is_sl_subdomain:
+            user = domain.user
+            user._subdomain_quota -= 1
+            Session.flush()
+
+        return domain
+
+    @classmethod
+    def delete(cls, obj_id):
+        obj: CustomDomain = cls.get(obj_id)
+        if obj.is_sl_subdomain:
+            DeletedSubdomain.create(domain=obj.domain)
+
+        from app import alias_utils
+
+        for alias in Alias.filter_by(custom_domain_id=obj_id):
+            alias_utils.delete_alias(
+                alias, obj.user, AliasDeleteReason.CustomDomainDeleted
+            )
+
+        return super(CustomDomain, cls).delete(obj_id)
+
+    @property
+    def auto_create_rules(self):
+        return sorted(self._auto_create_rules, key=lambda rule: rule.order)
