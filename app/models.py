@@ -2310,19 +2310,6 @@ class Coupon(Base, ModelMixin):
     expires_date = sa.Column(ArrowType, nullable=True)
 
 
-class Directory(Base, ModelMixin):
-    __tablename__ = "directory"
-    user_id = sa.Column(sa.ForeignKey(User.id, ondelete="cascade"), nullable=False)
-    name = sa.Column(sa.String(128), unique=True, nullable=False)
-    
-    disabled = sa.Column(sa.Boolean, default=False, nullable=False, server_default="0")
-
-    user = orm.relationship(User, backref="directories")
-
-    _mailboxes = orm.relationship(
-        "Mailbox", secondary="directory_mailbox", lazy="joined"
-    )
-
     @property
     def mailboxes(self):
         if self._mailboxes:
@@ -2405,3 +2392,206 @@ class Mailbox(Base, ModelMixin):
 
     
     new_email = sa.Column(sa.String(256), unique=True)
+
+    pgp_public_key = sa.Column(sa.Text, nullable=True)
+    pgp_finger_print = sa.Column(sa.String(512), nullable=True)
+    disable_pgp = sa.Column(
+        sa.Boolean, default=False, nullable=False, server_default="0"
+    )
+
+    
+    nb_failed_checks = sa.Column(
+        sa.Integer, default=0, server_default="0", nullable=False
+    )
+
+    
+    disabled = sa.Column(sa.Boolean, default=False, nullable=False, server_default="0")
+
+    generic_subject = sa.Column(sa.String(78), nullable=True)
+
+    __table_args__ = (sa.UniqueConstraint("user_id", "email", name="uq_mailbox_user"),)
+
+    user = orm.relationship(User, foreign_keys=[user_id])
+
+    def pgp_enabled(self) -> bool:
+        if self.pgp_finger_print and not self.disable_pgp:
+            return True
+
+        return False
+
+    def nb_alias(self):
+        alias_ids = set(
+            am.alias_id
+            for am in AliasMailbox.filter_by(mailbox_id=self.id).values(
+                AliasMailbox.alias_id
+            )
+        )
+        for alias in Alias.filter_by(mailbox_id=self.id).values(Alias.id):
+            alias_ids.add(alias.id)
+        return len(alias_ids)
+
+    def is_(self) -> bool:
+        if (
+            self.email.endswith("@.me")
+            or self.email.endswith("@mail.com")
+            or self.email.endswith("@mail.ch")
+            or self.email.endswith("@.ch")
+            or self.email.endswith("@pm.me")
+        ):
+            return True
+
+        from app.email_utils import get_email_local_part
+
+        mx_domains: [(int, str)] = get_mx_domains(get_email_local_part(self.email))
+        
+        if mx_domains and mx_domains[0][1] in (
+            "mail.mail.ch.",
+            "mailsec.mail.ch.",
+        ):
+            return True
+
+        return False
+
+    @classmethod
+    def delete(cls, obj_id):
+        mailbox: Mailbox = cls.get(obj_id)
+        user = mailbox.user
+
+        
+        for alias in Alias.filter_by(mailbox_id=obj_id):
+            
+            if len(alias.mailboxes) > 1:
+                
+                first_mb = alias._mailboxes[0]
+                alias.mailbox_id = first_mb.id
+                alias._mailboxes.remove(first_mb)
+            else:
+                from app import alias_utils
+
+                
+                alias_utils.delete_alias(alias, user, AliasDeleteReason.MailboxDeleted)
+            Session.commit()
+
+        cls.filter(cls.id == obj_id).delete()
+        Session.commit()
+
+    @property
+    def aliases(self) -> [Alias]:
+        ret = dict(
+            (alias.id, alias) for alias in Alias.filter_by(mailbox_id=self.id).all()
+        )
+
+        for am in AliasMailbox.filter_by(mailbox_id=self.id):
+            if am.alias_id not in ret:
+                ret[am.alias_id] = am.alias
+
+        return list(ret.values())
+
+    @classmethod
+    def create(cls, **kw):
+        if "email" in kw:
+            kw["email"] = sanitize_email(kw["email"])
+        return super().create(**kw)
+
+    def __repr__(self):
+        return f"<Mailbox {self.id} {self.email}>"
+
+
+class MailboxActivation(Base, ModelMixin):
+    __tablename__ = "mailbox_activation"
+
+    mailbox_id = sa.Column(
+        sa.ForeignKey(Mailbox.id, ondelete="cascade"), nullable=False, index=True
+    )
+    code = sa.Column(sa.String(32), nullable=False, index=True)
+    tries = sa.Column(sa.Integer, default=0, nullable=False)
+
+
+class AccountActivation(Base, ModelMixin):
+    """contains code to activate the user account when they sign up on mobile"""
+
+    __tablename__ = "account_activation"
+
+    user_id = sa.Column(
+        sa.ForeignKey(User.id, ondelete="cascade"), nullable=False, unique=True
+    )
+    
+    code = sa.Column(sa.String(10), nullable=False)
+
+    
+    tries = sa.Column(sa.Integer, default=3, nullable=False)
+
+    __table_args__ = (
+        CheckConstraint(tries >= 0, name="account_activation_tries_positive"),
+        {},
+    )
+
+
+class RefusedEmail(Base, ModelMixin):
+    """Store emails that have been refused, i.e. bounced or classified as spams"""
+
+    __tablename__ = "refused_email"
+
+    
+    full_report_path = sa.Column(sa.String(128), unique=True, nullable=False)
+
+    
+    path = sa.Column(sa.String(128), unique=True, nullable=True)
+
+    user_id = sa.Column(sa.ForeignKey(User.id, ondelete="cascade"), nullable=False)
+
+    
+    delete_at = sa.Column(ArrowType, nullable=False, default=_expiration_7d)
+
+    
+    deleted = sa.Column(sa.Boolean, nullable=False, default=False, server_default="0")
+
+    def get_url(self, expires_in=3600):
+        if self.path:
+            return s3.get_url(self.path, expires_in)
+        else:
+            return s3.get_url(self.full_report_path, expires_in)
+
+    def __repr__(self):
+        return f"<Refused Email {self.id} {self.path} {self.delete_at}>"
+
+
+class Referral(Base, ModelMixin):
+    """Referral code so user can invite others"""
+
+    __tablename__ = "referral"
+
+    user_id = sa.Column(sa.ForeignKey(User.id, ondelete="cascade"), nullable=False)
+    name = sa.Column(sa.String(512), nullable=True, default=None)
+
+    code = sa.Column(sa.String(128), unique=True, nullable=False)
+
+    user = orm.relationship(User, foreign_keys=[user_id], backref="referrals")
+
+    @property
+    def nb_user(self) -> int:
+        return User.filter_by(referral_id=self.id, activated=True).count()
+
+    @property
+    def nb_paid_user(self) -> int:
+        res = 0
+        for user in User.filter_by(referral_id=self.id, activated=True):
+            if user.is_paid():
+                res += 1
+
+        return res
+
+    def link(self):
+        return f"{config.LANDING_PAGE_URL}?slref={self.code}"
+
+    def __repr__(self):
+        return f"<Referral {self.code}>"
+
+
+class SentAlert(Base, ModelMixin):
+
+    __tablename__ = "sent_alert"
+
+    user_id = sa.Column(sa.ForeignKey(User.id, ondelete="cascade"), nullable=False)
+    to_email = sa.Column(sa.String(256), nullable=False)
+    alert_type = sa.Column(sa.String(256), nullable=False)
