@@ -609,7 +609,7 @@ class User(Base, ModelMixin, UserMixin, PasswordOracle):
         Session.flush()
 
         return user
-        
+
 
     def get_active_subscription(
         self, include_partner_subscription: bool = True
@@ -755,25 +755,6 @@ class User(Base, ModelMixin, UserMixin, PasswordOracle):
         coinbase_subscription: CoinbaseSubscription = CoinbaseSubscription.get_by(
             user_id=self.id
         )
-        if coinbase_subscription and coinbase_subscription.is_active():
-            channels.append(
-                f"Coinbase Subscription ends {coinbase_subscription.end_at.humanize()}"
-            )
-
-        r = (
-            Session.query(PartnerSubscription, PartnerUser, Partner)
-            .filter(
-                PartnerSubscription.partner_user_id == PartnerUser.id,
-                PartnerUser.user_id == self.id,
-                Partner.id == PartnerUser.partner_id,
-            )
-            .first()
-        )
-        if r and r[0].is_active():
-            channels.append(
-                f"Subscription via {r[2].name} partner , ends {r[0].end_at.humanize()}"
-            )
-
         return ".\n".join(channels)
 
     
@@ -873,3 +854,202 @@ class User(Base, ModelMixin, UserMixin, PasswordOracle):
                 return None
         else:
             return sub
+
+
+         def verified_custom_domains(self) -> List["CustomDomain"]:
+        return (
+            CustomDomain.filter_by(user_id=self.id, ownership_verified=True)
+            .order_by(CustomDomain.domain.asc())
+            .all()
+        )
+
+    def mailboxes(self) -> List["Mailbox"]:
+        """list of mailbox that user own"""
+        mailboxes = []
+
+        for mailbox in Mailbox.filter_by(user_id=self.id, verified=True):
+            mailboxes.append(mailbox)
+
+        return mailboxes
+
+    def nb_directory(self):
+        return Directory.filter_by(user_id=self.id).count()
+
+    def has_custom_domain(self):
+        return CustomDomain.filter_by(user_id=self.id, verified=True).count() > 0
+
+    def custom_domains(self):
+        return CustomDomain.filter_by(user_id=self.id, verified=True).all()
+
+    def available_domains_for_random_alias(
+        self, alias_options: Optional[AliasOptions] = None
+    ) -> List[Tuple[bool, str]]:
+        """Return available domains for user to create random aliases
+        Each result record contains:
+        - whether the domain belongs to Login
+        - the domain
+        """
+        res = []
+        for domain in self.get_sl_domains(alias_options=alias_options):
+            res.append((True, domain.domain))
+
+        for custom_domain in self.verified_custom_domains():
+            res.append((False, custom_domain.domain))
+
+        return res
+
+    def default_random_alias_domain(self) -> str:
+        """return the domain used for the random alias"""
+        if self.default_alias_custom_domain_id:
+            custom_domain = CustomDomain.get(self.default_alias_custom_domain_id)
+            
+            if (
+                not custom_domain
+                or not custom_domain.verified
+                or custom_domain.user_id != self.id
+            ):
+                LOG.w("Problem with %s default random alias domain", self)
+                return config.FIRST_ALIAS_DOMAIN
+
+            return custom_domain.domain
+
+        if self.default_alias_public_domain_id:
+            sl_domain = SLDomain.get(self.default_alias_public_domain_id)
+            
+            if not sl_domain:
+                LOG.e("Problem with %s public random alias domain", self)
+                return config.FIRST_ALIAS_DOMAIN
+
+            if sl_domain.premium_only and not self.is_premium():
+                LOG.w(
+                    "%s is not premium and cannot use %s. Reset default random alias domain setting",
+                    self,
+                    sl_domain,
+                )
+                self.default_alias_custom_domain_id = None
+                self.default_alias_public_domain_id = None
+                Session.commit()
+                return config.FIRST_ALIAS_DOMAIN
+
+            return sl_domain.domain
+
+        return config.FIRST_ALIAS_DOMAIN
+
+    def fido_enabled(self) -> bool:
+        if self.fido_uuid is not None:
+            return True
+        return False
+
+    def two_factor_authentication_enabled(self) -> bool:
+        return self.enable_otp or self.fido_enabled()
+
+    def get_communication_email(self) -> (Optional[str], str, bool):
+        """
+        Return
+        - the email that user uses to receive email communication. None if user unsubscribes from newsletter
+        - the unsubscribe URL
+        - whether the unsubscribe method is via sending email (mailto:) or Http POST
+        """
+        if self.notification and self.activated and not self.disabled:
+            if self.newsletter_alias_id:
+                alias = Alias.get(self.newsletter_alias_id)
+                if alias.enabled:
+                    unsub = UnsubscribeEncoder.encode(
+                        UnsubscribeAction.DisableAlias, alias.id
+                    )
+                    return alias.email, unsub.link, unsub.via_email
+                
+                else:
+                    return None, "", False
+            else:
+                
+                if config.UNSUBSCRIBER:
+                    
+                    return (
+                        self.email,
+                        UnsubscribeEncoder.encode_mailto(
+                            UnsubscribeAction.UnsubscribeNewsletter, self.id
+                        ),
+                        True,
+                    )
+
+        return None, "", False
+
+    def available_sl_domains(
+        self, alias_options: Optional[AliasOptions] = None
+    ) -> [str]:
+        """
+        Return all Login domains that user can use when creating a new alias, including:
+        - Login public domains, available for all users (ALIAS_DOMAIN)
+        - Login premium domains, only available for Premium accounts (PREMIUM_ALIAS_DOMAIN)
+        """
+        return [
+            sl_domain.domain
+            for sl_domain in self.get_sl_domains(alias_options=alias_options)
+        ]
+
+    def get_sl_domains(
+        self, alias_options: Optional[AliasOptions] = None
+    ) -> list["SLDomain"]:
+        if alias_options is None:
+            alias_options = AliasOptions()
+        top_conds = [SLDomain.hidden == False]  
+        or_conds = []  
+        if self.default_alias_public_domain_id is not None:
+            default_domain_conds = [SLDomain.id == self.default_alias_public_domain_id]
+            if not self.is_premium():
+                default_domain_conds.append(
+                    SLDomain.premium_only == False  
+                )
+            or_conds.append(and_(*default_domain_conds).self_group())
+        if alias_options.show_partner_domains is not None:
+            partner_user = PartnerUser.filter_by(
+                user_id=self.id, partner_id=alias_options.show_partner_domains.id
+            ).first()
+            if partner_user is not None:
+                partner_domain_cond = [SLDomain.partner_id == partner_user.partner_id]
+                if alias_options.show_partner_premium is None:
+                    alias_options.show_partner_premium = self.is_premium()
+                if not alias_options.show_partner_premium:
+                    partner_domain_cond.append(
+                        SLDomain.premium_only == False  
+                    )
+                or_conds.append(and_(*partner_domain_cond).self_group())
+        if alias_options.show_sl_domains:
+            sl_conds = [SLDomain.partner_id == None]  
+            if not self.is_premium():
+                sl_conds.append(SLDomain.premium_only == False)  
+            or_conds.append(and_(*sl_conds).self_group())
+        top_conds.append(or_(*or_conds))
+        query = Session.query(SLDomain).filter(*top_conds).order_by(SLDomain.order)
+        return query.all()
+
+    def available_alias_domains(
+        self, alias_options: Optional[AliasOptions] = None
+    ) -> [str]:
+        """return all domains that user can use when creating a new alias, including:
+        - Login public domains, available for all users (ALIAS_DOMAIN)
+        - Login premium domains, only available for Premium accounts (PREMIUM_ALIAS_DOMAIN)
+        - Verified custom domains
+
+        """
+        domains = [
+            sl_domain.domain
+            for sl_domain in self.get_sl_domains(alias_options=alias_options)
+        ]
+
+        for custom_domain in self.verified_custom_domains():
+            domains.append(custom_domain.domain)
+
+        
+        return list(set(domains))
+
+    def should_show_app_page(self) -> bool:
+        """whether to show the app page"""
+        return (
+            
+            ClientUser.filter(ClientUser.user_id == self.id).count()
+            
+            + Client.filter(Client.user_id == self.id).count()
+            > 0
+        )
