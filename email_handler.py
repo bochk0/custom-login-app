@@ -745,20 +745,7 @@ def handle_forward(envelope, msg: Message, rcpt_to: str) -> List[Tuple[bool, str
         headers_to_keep.append(headers.AUTHENTICATION_RESULTS)
     delete_all_headers_except(msg, headers_to_keep)
 
-    if mailbox.generic_subject:
-        LOG.d("Use a generic subject for %s", mailbox)
-        orig_subject = msg[headers.SUBJECT]
-        orig_subject = get_header_unicode(orig_subject)
-        add_or_replace_header(msg, "Subject", mailbox.generic_subject)
-        sender = msg[headers.FROM]
-        sender = get_header_unicode(sender)
-        msg = add_header(
-            msg,
-            f"""Forwarded by Login to {alias.email} from "{sender}" with "{orig_subject}" as subject""",
-            f"""Forwarded by Login to {alias.email} from "{sender}" with <b>{orig_subject}</b> as subject""",
-        )
 
-    
     if mailbox.pgp_enabled() and user.is_premium() and not alias.disable_pgp:
         LOG.d("Encrypt message using mailbox %s", mailbox)
 
@@ -814,3 +801,225 @@ def handle_forward(envelope, msg: Message, rcpt_to: str) -> List[Tuple[bool, str
         EmailLog.delete(email_log.id)
         Session.commit()
         raise
+
+    add_alias_to_header_if_needed(msg, alias)
+
+    
+    msg = UnsubscribeGenerator().add_header_to_message(alias, contact, msg)
+
+    add_dkim_signature(msg, EMAIL_DOMAIN)
+
+    LOG.d(
+        "Forward mail from %s to %s, mail_options:%s, rcpt_options:%s ",
+        contact.website_email,
+        mailbox.email,
+        envelope.mail_options,
+        envelope.rcpt_options,
+    )
+
+    contact_domain = get_email_domain_part(contact.reply_email)
+    try:
+        sl_sendmail(
+            
+            generate_verp_email(VerpType.bounce_forward, email_log.id, contact_domain),
+            mailbox.email,
+            msg,
+            envelope.mail_options,
+            envelope.rcpt_options,
+            is_forward=True,
+        )
+    except (SMTPServerDisconnected, SMTPRecipientsRefused, TimeoutError):
+        LOG.w(
+            "Postfix error during forward phase %s -> %s -> %s",
+            contact,
+            alias,
+            mailbox,
+            exc_info=True,
+        )
+        if should_ignore_bounce(envelope.mail_from):
+            return True, status.E207
+        else:
+            EmailLog.delete(email_log.id, commit=True)
+            
+            return False, status.E407
+    else:
+        Session.commit()
+        return True, status.E200
+
+
+def replace_sl_message_id_by_original_message_id(msg):
+    
+    if msg[headers.IN_REPLY_TO]:
+        matching: MessageIDMatching = MessageIDMatching.get_by(
+            sl_message_id=str(msg[headers.IN_REPLY_TO])
+        )
+        if matching:
+            LOG.d(
+                "replace SL message id by original one in in-reply-to header, %s -> %s",
+                msg[headers.IN_REPLY_TO],
+                matching.original_message_id,
+            )
+            del msg[headers.IN_REPLY_TO]
+            msg[headers.IN_REPLY_TO] = matching.original_message_id
+
+    
+    if msg[headers.REFERENCES]:
+        message_ids = str(msg[headers.REFERENCES]).split()
+        new_message_ids = []
+        for message_id in message_ids:
+            matching = MessageIDMatching.get_by(sl_message_id=message_id)
+            if matching:
+                LOG.d(
+                    "replace SL message id by original one in references header, %s -> %s",
+                    message_id,
+                    matching.original_message_id,
+                )
+                new_message_ids.append(matching.original_message_id)
+            else:
+                new_message_ids.append(message_id)
+
+        del msg[headers.REFERENCES]
+        msg[headers.REFERENCES] = " ".join(new_message_ids)
+
+
+def handle_reply(envelope, msg: Message, rcpt_to: str) -> (bool, str):
+
+    reply_email = rcpt_to
+
+    reply_domain = get_email_domain_part(reply_email)
+
+    
+    if not reply_email.endswith(EMAIL_DOMAIN):
+        sl_domain: SLDomain = SLDomain.get_by(domain=reply_domain)
+        if sl_domain is None:
+            LOG.w(f"Reply email {reply_email} has wrong domain")
+            return False, status.E501
+
+    
+    reply_email = normalize_reply_email(reply_email)
+
+    contact = Contact.get_by(reply_email=reply_email)
+    if not contact:
+        LOG.w(f"No contact with {reply_email} as reverse alias")
+        return False, status.E502
+    if not contact.user.is_active():
+        LOG.w(f"User {contact.user} has been soft deleted")
+        return False, status.E502
+
+    alias = contact.alias
+    alias_address: str = contact.alias.email
+    alias_domain = get_email_domain_part(alias_address)
+    
+    if not is_valid_alias_address_domain(alias.email):
+        LOG.e("%s domain isn't known", alias)
+        return False, status.E503
+
+    user = alias.user
+    mail_from = envelope.mail_from
+
+    if not user.can_send_or_receive():
+        LOG.i(f"User {user} cannot send emails")
+        return False, status.E504
+
+    
+    dmarc_delivery_status = apply_dmarc_policy_for_reply_phase(
+        alias, contact, envelope, msg
+    )
+    if dmarc_delivery_status is not None:
+        return False, dmarc_delivery_status
+
+    
+    mailbox = get_mailbox_from_mail_from(mail_from, alias)
+    if not mailbox:
+        if alias.disable_email_spoofing_check:
+            
+            LOG.w(
+                "ignore unknown sender to reverse-alias %s: %s -> %s",
+                mail_from,
+                alias,
+                contact,
+            )
+            mailbox = alias.mailbox
+        else:
+            
+            handle_unknown_mailbox(envelope, msg, reply_email, user, alias, contact)
+            
+            return False, status.E214
+
+    if ENFORCE_SPF and mailbox.force_spf and not alias.disable_email_spoofing_check:
+        if not spf_pass(envelope, mailbox, user, alias, contact.website_email, msg):
+            
+            
+            return True, status.E201
+
+    email_log = EmailLog.create(
+        contact_id=contact.id,
+        alias_id=contact.alias_id,
+        is_reply=True,
+        user_id=contact.user_id,
+        mailbox_id=mailbox.id,
+        message_id=msg[headers.MESSAGE_ID],
+        commit=True,
+    )
+    LOG.d("Create %s for %s, %s, %s", email_log, contact, user, mailbox)
+
+    
+    if ENABLE_SPAM_ASSASSIN:
+        spam_status = ""
+        is_spam = False
+
+        
+        if SPAMASSASSIN_HOST:
+            start = time.time()
+            spam_score, spam_report = get_spam_score(msg, email_log)
+            LOG.d(
+                "%s -> %s - spam score %s in %s seconds. Spam report %s",
+                alias,
+                contact,
+                spam_score,
+                time.time() - start,
+                spam_report,
+            )
+            email_log.spam_score = spam_score
+            if spam_score > MAX_REPLY_PHASE_SPAM_SCORE:
+                is_spam = True
+                
+                email_log.spam_report = spam_report
+        else:
+            is_spam, spam_status = get_spam_info(
+                msg, max_score=MAX_REPLY_PHASE_SPAM_SCORE
+            )
+
+        if is_spam:
+            LOG.w(
+                "Email detected as spam. Reply phase. %s -> %s. Spam Score: %s, Spam Report: %s",
+                alias,
+                contact,
+                email_log.spam_score,
+                email_log.spam_report,
+            )
+
+            email_log.is_spam = True
+            email_log.spam_status = spam_status
+            Session.commit()
+
+            handle_spam(contact, alias, msg, user, mailbox, email_log, is_reply=True)
+            return False, status.E506
+
+    delete_all_headers_except(
+        msg,
+        [
+            headers.FROM,
+            headers.TO,
+            headers.CC,
+            headers.SUBJECT,
+            headers.DATE,
+            
+            headers.MESSAGE_ID,
+            
+            headers.REFERENCES,
+            headers.IN_REPLY_TO,
+            headers.SL_QUEUE_ID,
+        ]
+        + headers.MIME_HEADERS,
+    )
