@@ -313,27 +313,6 @@ def get_or_create_reply_to_contact(
         delete_header(msg, header)
 
 
-def add_alias_to_header_if_needed(msg, alias):
-
-    to_header = str(msg[headers.TO]) if msg[headers.TO] else None
-    cc_header = str(msg[headers.CC]) if msg[headers.CC] else None
-
-    
-    if to_header and alias.email in to_header:
-        return
-
-    
-    if cc_header and alias.email in cc_header:
-        return
-
-    LOG.d(f"add {alias} to To: header {to_header}")
-
-    if to_header:
-        add_or_replace_header(msg, headers.TO, f"{to_header},{alias.email}")
-    else:
-        add_or_replace_header(msg, headers.TO, alias.email)
-
-
 def replace_header_when_reply(msg: Message, alias: Alias, header: str):
 
     new_addrs: [str] = []
@@ -452,3 +431,210 @@ def sign_msg(msg: Message) -> Message:
         _subtype="pgp-signature", name="signature.asc", _data="", _encoder=encode_noop
     )
     signature.add_header("Content-Disposition", 'attachment; filename="signature.asc"')
+
+    try:
+        payload = sign_data(message_to_bytes(msg).replace(b"\n", b"\r\n"))
+
+        if not payload:
+            raise PGPException("Empty signature by gnupg")
+
+        signature.set_payload(payload)
+    except Exception:
+        LOG.e("Cannot sign, try using pgpy")
+        payload = sign_data_with_pgpy(message_to_bytes(msg).replace(b"\n", b"\r\n"))
+
+        if not payload:
+            raise PGPException("Empty signature by pgpy")
+
+        signature.set_payload(payload)
+
+    container.attach(signature)
+
+    return container
+
+
+def handle_email_sent_to_ourself(alias, from_addr: str, msg: Message, user):
+    
+    random_name = str(uuid.uuid4())
+    full_report_path = f"refused-emails/cycle-{random_name}.eml"
+    s3.upload_email_from_bytesio(
+        full_report_path, BytesIO(message_to_bytes(msg)), random_name
+    )
+    refused_email = RefusedEmail.create(
+        path=None, full_report_path=full_report_path, user_id=alias.user_id
+    )
+    Session.commit()
+    LOG.d("Create refused email %s", refused_email)
+    
+    refused_email_url = refused_email.get_url(expires_in=518400)
+
+    Notification.create(
+        user_id=user.id,
+        title=f"Email sent to {alias.email} from its own mailbox {from_addr}",
+        message=Notification.render(
+            "notification/cycle-email.html",
+            alias=alias,
+            from_addr=from_addr,
+            refused_email_url=refused_email_url,
+        ),
+        commit=True,
+    )
+
+    send_email_at_most_times(
+        user,
+        ALERT_SEND_EMAIL_CYCLE,
+        from_addr,
+        f"Email sent to {alias.email} from its own mailbox {from_addr}",
+        render(
+            "transactional/cycle-email.txt.jinja2",
+            user=user,
+            alias=alias,
+            from_addr=from_addr,
+            refused_email_url=refused_email_url,
+        ),
+        render(
+            "transactional/cycle-email.html",
+            user=user,
+            alias=alias,
+            from_addr=from_addr,
+            refused_email_url=refused_email_url,
+        ),
+    )
+
+
+def handle_forward(envelope, msg: Message, rcpt_to: str) -> List[Tuple[bool, str]]:
+
+    alias_address = rcpt_to  
+
+    alias = Alias.get_by(email=alias_address)
+    if not alias:
+        LOG.d(
+            "alias %s not exist. Try to see if it can be created on the fly",
+            alias_address,
+        )
+        alias = try_auto_create(alias_address)
+        if not alias:
+            LOG.d("alias %s cannot be created on-the-fly, return 550", alias_address)
+            if should_ignore_bounce(envelope.mail_from):
+                return [(True, status.E207)]
+            else:
+                return [(False, status.E515)]
+
+    user = alias.user
+
+    if not user.is_active():
+        LOG.w(f"User {user} has been soft deleted")
+        return False, status.E502
+
+    if not user.can_send_or_receive():
+        LOG.i(f"User {user} cannot receive emails")
+        if should_ignore_bounce(envelope.mail_from):
+            return [(True, status.E207)]
+        else:
+            return [(False, status.E504)]
+
+    
+    mail_from = envelope.mail_from
+    for addr in alias.authorized_addresses():
+        
+        if addr == mail_from:
+            LOG.i("cycle email sent from %s to %s", addr, alias)
+            handle_email_sent_to_ourself(alias, addr, msg, user)
+            return [(True, status.E209)]
+
+    from_header = get_header_unicode(msg[headers.FROM])
+    LOG.d("Create or get contact for from_header:%s", from_header)
+    contact = get_or_create_contact(from_header, envelope.mail_from, alias)
+    alias = (
+        contact.alias
+    )  
+
+    reply_to_contact = None
+    if msg[headers.REPLY_TO]:
+        reply_to = get_header_unicode(msg[headers.REPLY_TO])
+        LOG.d("Create or get contact for reply_to_header:%s", reply_to)
+        
+        if reply_to == alias.email:
+            LOG.i("Reply-to same as alias %s", alias)
+        else:
+            reply_to_contact = get_or_create_reply_to_contact(reply_to, alias, msg)
+
+    if not alias.enabled or contact.block_forward:
+        LOG.d("%s is disabled, do not forward", alias)
+        EmailLog.create(
+            contact_id=contact.id,
+            user_id=contact.user_id,
+            blocked=True,
+            alias_id=contact.alias_id,
+            commit=True,
+        )
+
+        res_status = status.E200
+        if user.block_behaviour == BlockBehaviourEnum.return_5xx:
+            res_status = status.E502
+
+        return [(True, res_status)]
+
+    
+    msg, dmarc_delivery_status = apply_dmarc_policy_for_forward_phase(
+        alias, contact, envelope, msg
+    )
+    if dmarc_delivery_status is not None:
+        return [(False, dmarc_delivery_status)]
+
+    ret = []
+    mailboxes = alias.mailboxes
+
+    
+    if not mailboxes:
+        LOG.w("no valid mailboxes for %s", alias)
+        if should_ignore_bounce(envelope.mail_from):
+            return [(True, status.E207)]
+        else:
+            return [(False, status.E516)]
+
+    for mailbox in mailboxes:
+        if not mailbox.verified:
+            LOG.d("%s unverified, do not forward", mailbox)
+            ret.append((False, status.E517))
+        else:
+            
+            mailbox_as_alias = Alias.get_by(email=mailbox.email)
+            if mailbox_as_alias is not None:
+                LOG.info(
+                    f"Mailbox {mailbox.id} has email {mailbox.email} that is also alias {alias.id}. Stopping loop"
+                )
+                mailbox.verified = False
+                Session.commit()
+                mailbox_url = f"{URL}/dashboard/mailbox/{mailbox.id}/"
+                send_email_with_rate_control(
+                    user,
+                    ALERT_MAILBOX_IS_ALIAS,
+                    user.email,
+                    f"Your mailbox {mailbox.email} is an alias",
+                    render(
+                        "transactional/mailbox-invalid.txt.jinja2",
+                        user=mailbox.user,
+                        mailbox=mailbox,
+                        mailbox_url=mailbox_url,
+                        alias=alias,
+                    ),
+                    render(
+                        "transactional/mailbox-invalid.html",
+                        user=mailbox.user,
+                        mailbox=mailbox,
+                        mailbox_url=mailbox_url,
+                        alias=alias,
+                    ),
+                    max_nb_alert=1,
+                )
+                ret.append((False, status.E525))
+                continue
+            
+            ret.append(
+                forward_email_to_mailbox(
+                    alias, copy(msg), contact, envelope, mailbox, user, reply_to_contact
+                )
+            )
+
+    return ret
