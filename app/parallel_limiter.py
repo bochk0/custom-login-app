@@ -45,22 +45,6 @@ class _InnerLock:
             lock_suffix = self.lock_suffix
 
         @wraps(f)
-        def decorated(*args, **kwargs):
-            if self.only_when and not self.only_when():
-                return f(*args, **kwargs)
-            if not lock_redis:
-                return f(*args, **kwargs)
-
-            lock_value = str(uuid.uuid4())[:10]
-            if "id" in dir(current_user):
-                lock_name = f"cl:{current_user.id}:{lock_suffix}"
-            else:
-                lock_name = f"cl:{request.remote_addr}:{lock_suffix}"
-            self.acquire_lock(lock_name, lock_value)
-            try:
-                return f(*args, **kwargs)
-            finally:
-                self.release_lock(lock_name, lock_value)
 
         return decorated
 
