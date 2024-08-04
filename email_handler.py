@@ -862,24 +862,6 @@ def replace_sl_message_id_by_original_message_id(msg):
             del msg[headers.IN_REPLY_TO]
             msg[headers.IN_REPLY_TO] = matching.original_message_id
 
-    
-    if msg[headers.REFERENCES]:
-        message_ids = str(msg[headers.REFERENCES]).split()
-        new_message_ids = []
-        for message_id in message_ids:
-            matching = MessageIDMatching.get_by(sl_message_id=message_id)
-            if matching:
-                LOG.d(
-                    "replace SL message id by original one in references header, %s -> %s",
-                    message_id,
-                    matching.original_message_id,
-                )
-                new_message_ids.append(matching.original_message_id)
-            else:
-                new_message_ids.append(message_id)
-
-        del msg[headers.REFERENCES]
-        msg[headers.REFERENCES] = " ".join(new_message_ids)
 
 
 def handle_reply(envelope, msg: Message, rcpt_to: str) -> (bool, str):
@@ -1023,3 +1005,205 @@ def handle_reply(envelope, msg: Message, rcpt_to: str) -> (bool, str):
         ]
         + headers.MIME_HEADERS,
     )
+
+    orig_to = msg[headers.TO]
+    orig_cc = msg[headers.CC]
+
+    
+    if user.replace_reverse_alias:
+        LOG.d("Replace reverse-alias %s by contact email %s", reply_email, contact)
+        msg = replace(msg, reply_email, contact.website_email)
+        LOG.d("Replace mailbox %s by alias email %s", mailbox.email, alias.email)
+        msg = replace(msg, mailbox.email, alias.email)
+
+        if config.ENABLE_ALL_REVERSE_ALIAS_REPLACEMENT:
+            start = time.time()
+            
+            contact_query = (
+                Contact.query()
+                .filter(Contact.alias_id == alias.id)
+                .limit(config.MAX_NB_REVERSE_ALIAS_REPLACEMENT)
+            )
+            
+            for reply_email, website_email in contact_query.values(
+                Contact.reply_email, Contact.website_email
+            ):
+                msg = replace(msg, reply_email, website_email)
+
+            elapsed = time.time() - start
+            LOG.d(
+                "Replace reverse alias by real address for %s contacts takes %s seconds",
+                contact_query.count(),
+                elapsed,
+            )
+            newrelic.agent.record_custom_metric(
+                "Custom/reverse_alias_replacement_time", elapsed
+            )
+
+    
+    if contact.pgp_finger_print and user.is_premium():
+        LOG.d("Encrypt message for contact %s", contact)
+        try:
+            msg = prepare_pgp_message(
+                msg, contact.pgp_finger_print, contact.pgp_public_key
+            )
+        except PGPException:
+            LOG.e(
+                "Cannot encrypt message %s -> %s. %s %s", alias, contact, mailbox, user
+            )
+            
+            EmailLog.delete(email_log.id, commit=True)
+            
+            return False, status.E402
+
+    Session.commit()
+
+    
+    from_header = alias.email
+    
+    if alias.name:
+        LOG.d("Put alias name %s in from header", alias.name)
+        from_header = sl_formataddr((alias.name, alias.email))
+    elif alias.custom_domain:
+        
+        if alias.custom_domain.name:
+            LOG.d(
+                "Put domain default alias name %s in from header",
+                alias.custom_domain.name,
+            )
+            from_header = sl_formataddr((alias.custom_domain.name, alias.email))
+
+    LOG.d("From header is %s", from_header)
+    add_or_replace_header(msg, headers.FROM, from_header)
+
+    try:
+        if str(msg[headers.TO]).lower() == "undisclosed-recipients:;":
+            
+            LOG.d("email is sent in BCC mode")
+        else:
+            replace_header_when_reply(msg, alias, headers.TO)
+
+        replace_header_when_reply(msg, alias, headers.CC)
+    except NonReverseAliasInReplyPhase as e:
+        LOG.w("non reverse-alias in reply %s %s %s", e, contact, alias)
+
+        
+        EmailLog.delete(email_log.id, commit=True)
+
+        send_email(
+            mailbox.email,
+            f"Email sent to {contact.email} contains non reverse-alias addresses",
+            render(
+                "transactional/non-reverse-alias-reply-phase.txt.jinja2",
+                user=alias.user,
+                destination=contact.email,
+                alias=alias.email,
+                subject=msg[headers.SUBJECT],
+            ),
+        )
+        
+        return True, status.E200
+
+    replace_original_message_id(alias, email_log, msg)
+
+    if not msg[headers.DATE]:
+        date_header = formatdate()
+        LOG.w("missing date header, add one")
+        msg[headers.DATE] = date_header
+
+    msg[headers.SL_DIRECTION] = "Reply"
+    msg[headers.SL_EMAIL_LOG_ID] = str(email_log.id)
+
+    LOG.d(
+        "send email from %s to %s, mail_options:%s,rcpt_options:%s",
+        alias.email,
+        contact.website_email,
+        envelope.mail_options,
+        envelope.rcpt_options,
+    )
+
+    if should_add_dkim_signature(alias_domain):
+        add_dkim_signature(msg, alias_domain)
+
+    try:
+        sl_sendmail(
+            generate_verp_email(VerpType.bounce_reply, email_log.id, alias_domain),
+            contact.website_email,
+            msg,
+            envelope.mail_options,
+            envelope.rcpt_options,
+            is_forward=False,
+        )
+
+        
+        other_mailboxes = [mb for mb in alias.mailboxes if mb.email != mailbox.email]
+        for mb in other_mailboxes:
+            notify_mailbox(alias, mailbox, mb, msg, orig_to, orig_cc, alias_domain)
+
+    except Exception:
+        LOG.w("Cannot send email from %s to %s", alias, contact)
+        EmailLog.delete(email_log.id, commit=True)
+        send_email(
+            mailbox.email,
+            f"Email cannot be sent to {contact.email} from {alias.email}",
+            render(
+                "transactional/reply-error.txt.jinja2",
+                user=user,
+                alias=alias,
+                contact=contact,
+                contact_domain=get_email_domain_part(contact.email),
+            ),
+            render(
+                "transactional/reply-error.html",
+                user=user,
+                alias=alias,
+                contact=contact,
+                contact_domain=get_email_domain_part(contact.email),
+            ),
+        )
+
+    
+    return True, status.E200
+
+
+def notify_mailbox(
+    alias, mailbox, other_mb: Mailbox, msg, orig_to, orig_cc, alias_domain
+):
+    """Notify another mailbox about an email sent by a mailbox to a reverse alias"""
+    LOG.d(
+        f"notify {other_mb.email} about email sent "
+        f"from {mailbox.email} on behalf of {alias.email} to {msg[headers.TO]}"
+    )
+    notif = add_header(
+        msg,
+        f"""**** Don't forget to remove this section if you reply to this email ****
+Email sent on behalf of alias {alias.email} using mailbox {mailbox.email}""",
+    )
+    
+    add_or_replace_header(notif, headers.FROM, alias.email)
+    
+    add_or_replace_header(notif, headers.TO, orig_to)
+    add_or_replace_header(notif, headers.CC, orig_cc)
+
+    
+    if should_add_dkim_signature(alias_domain):
+        add_dkim_signature(msg, alias_domain)
+
+    
+    transaction = TransactionalEmail.create(email=other_mb.email, commit=True)
+    sl_sendmail(
+        generate_verp_email(VerpType.transactional, transaction.id, alias_domain),
+        other_mb.email,
+        notif,
+    )
+
+
+def replace_original_message_id(alias: Alias, email_log: EmailLog, msg: Message):
+
+    original_message_id = msg[headers.MESSAGE_ID]
+    if original_message_id:
+        matching = MessageIDMatching.get_by(original_message_id=original_message_id)
+        
+        if matching:
+            sl_message_id = matching.sl_message_id
+            LOG.d("reuse the sl_message_id %s", sl_message_id)
