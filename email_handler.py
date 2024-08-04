@@ -181,13 +181,6 @@ def get_or_create_contact(from_header: str, mail_from: str, alias: Alias) -> Con
             )
 
             Session.commit()
-        except IntegrityError:
-            
-            Session.close()
-            LOG.info(
-                f"Contact with email {contact_email} for alias_id {alias_id} already existed, fetching from DB"
-            )
-            contact = Contact.get_by(alias_id=alias_id, website_email=contact_email)
 
     return contact
 
@@ -239,3 +232,223 @@ def get_or_create_reply_to_contact(
             contact = Contact.get_by(alias_id=alias.id, website_email=contact_address)
 
     return contact
+
+
+    def replace_header_when_forward(msg: Message, alias: Alias, header: str):
+
+    new_addrs: [str] = []
+    headers = msg.get_all(header, [])
+    
+    headers = [get_header_unicode(h) for h in headers]
+
+    full_addresses: [EmailAddress] = []
+    for h in headers:
+        full_addresses += address.parse_list(h)
+
+    for full_address in full_addresses:
+        contact_email = sanitize_email(full_address.address, not_lower=True)
+
+        
+        if contact_email.lower() == alias.email:
+            new_addrs.append(full_address.full_spec())
+            continue
+
+        try:
+            
+            validate_email(
+                contact_email, check_deliverability=False, allow_smtputf8=False
+            )
+        except EmailNotValidError:
+            LOG.w("invalid contact email %s. %s. Skip", contact_email, headers)
+            continue
+
+        contact = Contact.get_by(alias_id=alias.id, website_email=contact_email)
+        contact_name = full_address.display_name
+        if len(contact_name) >= Contact.MAX_NAME_LENGTH:
+            contact_name = contact_name[0 : Contact.MAX_NAME_LENGTH]
+
+        if contact:
+            
+            if contact.name != full_address.display_name:
+                LOG.d(
+                    "Update contact %s name %s to %s",
+                    contact,
+                    contact.name,
+                    contact_name,
+                )
+                contact.name = contact_name
+                Session.commit()
+        else:
+            LOG.d(
+                "create contact for alias %s and email %s, header %s",
+                alias,
+                contact_email,
+                header,
+            )
+
+            try:
+                contact = Contact.create(
+                    user_id=alias.user_id,
+                    alias_id=alias.id,
+                    website_email=contact_email,
+                    name=contact_name,
+                    reply_email=generate_reply_email(contact_email, alias),
+                    is_cc=header.lower() == "cc",
+                    automatic_created=True,
+                )
+                Session.commit()
+            except IntegrityError:
+                LOG.w("Contact %s %s already exist", alias, contact_email)
+                Session.rollback()
+                contact = Contact.get_by(alias_id=alias.id, website_email=contact_email)
+
+        new_addrs.append(contact.new_addr())
+
+    if new_addrs:
+        new_header = ",".join(new_addrs)
+        LOG.d("Replace %s header, old: %s, new: %s", header, msg[header], new_header)
+        add_or_replace_header(msg, header, new_header)
+    else:
+        LOG.d("Delete %s header, old value %s", header, msg[header])
+        delete_header(msg, header)
+
+
+def add_alias_to_header_if_needed(msg, alias):
+
+    to_header = str(msg[headers.TO]) if msg[headers.TO] else None
+    cc_header = str(msg[headers.CC]) if msg[headers.CC] else None
+
+    
+    if to_header and alias.email in to_header:
+        return
+
+    
+    if cc_header and alias.email in cc_header:
+        return
+
+    LOG.d(f"add {alias} to To: header {to_header}")
+
+    if to_header:
+        add_or_replace_header(msg, headers.TO, f"{to_header},{alias.email}")
+    else:
+        add_or_replace_header(msg, headers.TO, alias.email)
+
+
+def replace_header_when_reply(msg: Message, alias: Alias, header: str):
+
+    new_addrs: [str] = []
+    headers = msg.get_all(header, [])
+    
+    headers = [str(h) for h in headers]
+
+    
+    headers = [h.replace("\r", "") for h in headers]
+    headers = [h.replace("\n", "") for h in headers]
+
+    for _, reply_email in getaddresses(headers):
+        
+        
+        if reply_email == alias.email:
+            continue
+
+        contact = Contact.get_by(reply_email=reply_email)
+        if not contact:
+            LOG.w(
+                "email %s contained in %s header in reply phase must be reply emails. headers:%s",
+                reply_email,
+                header,
+                headers,
+            )
+            raise NonReverseAliasInReplyPhase(reply_email)
+            
+            
+        else:
+            new_addrs.append(sl_formataddr((contact.name, contact.website_email)))
+
+    if new_addrs:
+        new_header = ",".join(new_addrs)
+        LOG.d("Replace %s header, old: %s, new: %s", header, msg[header], new_header)
+        add_or_replace_header(msg, header, new_header)
+    else:
+        LOG.d("delete the %s header. Old value %s", header, msg[header])
+        delete_header(msg, header)
+
+
+def prepare_pgp_message(
+    orig_msg: Message, pgp_fingerprint: str, public_key: str, can_sign: bool = False
+) -> Message:
+    msg = MIMEMultipart("encrypted", protocol="application/pgp-encrypted")
+
+    
+    clone_msg = copy(orig_msg)
+
+    
+    for i in reversed(range(len(clone_msg._headers))):
+        header_name = clone_msg._headers[i][0].lower()
+        if header_name.lower() not in headers.MIME_HEADERS:
+            msg[header_name] = clone_msg._headers[i][1]
+
+    
+    delete_all_headers_except(
+        clone_msg,
+        headers.MIME_HEADERS,
+    )
+
+    if clone_msg[headers.CONTENT_TYPE] is None:
+        LOG.d("Content-Type missing")
+        clone_msg[headers.CONTENT_TYPE] = "text/plain"
+
+    if clone_msg[headers.MIME_VERSION] is None:
+        LOG.d("Mime-Version missing")
+        clone_msg[headers.MIME_VERSION] = "1.0"
+
+    first = MIMEApplication(
+        _subtype="pgp-encrypted", _encoder=encoders.encode_7or8bit, _data=""
+    )
+    first.set_payload("Version: 1")
+    msg.attach(first)
+
+    if can_sign and PGP_SENDER_PRIVATE_KEY:
+        LOG.d("Sign msg")
+        clone_msg = sign_msg(clone_msg)
+
+    
+    second = MIMEApplication(
+        "octet-stream", _encoder=encoders.encode_7or8bit, name="encrypted.asc"
+    )
+    second.add_header("Content-Disposition", 'inline; filename="encrypted.asc"')
+
+    
+    
+    msg_bytes = message_to_bytes(clone_msg)
+    try:
+        encrypted_data = pgp_utils.encrypt_file(BytesIO(msg_bytes), pgp_fingerprint)
+        second.set_payload(encrypted_data)
+    except PGPException:
+        LOG.w(
+            "Cannot encrypt using python-gnupg, check if public key is valid and try with pgpy"
+        )
+        
+        load_public_key_and_check(public_key)
+
+        encrypted = pgp_utils.encrypt_file_with_pgpy(msg_bytes, public_key)
+        second.set_payload(str(encrypted))
+        LOG.i(
+            f"encryption works with pgpy and not with python-gnupg, public key {public_key}"
+        )
+
+    msg.attach(second)
+
+    return msg
+
+
+def sign_msg(msg: Message) -> Message:
+    container = MIMEMultipart(
+        "signed", protocol="application/pgp-signature", micalg="pgp-sha256"
+    )
+    container.attach(msg)
+
+    signature = MIMEApplication(
+        _subtype="pgp-signature", name="signature.asc", _data="", _encoder=encode_noop
+    )
+    signature.add_header("Content-Disposition", 'attachment; filename="signature.asc"')
