@@ -559,32 +559,6 @@ def handle_forward(envelope, msg: Message, rcpt_to: str) -> List[Tuple[bool, str
         else:
             reply_to_contact = get_or_create_reply_to_contact(reply_to, alias, msg)
 
-    if not alias.enabled or contact.block_forward:
-        LOG.d("%s is disabled, do not forward", alias)
-        EmailLog.create(
-            contact_id=contact.id,
-            user_id=contact.user_id,
-            blocked=True,
-            alias_id=contact.alias_id,
-            commit=True,
-        )
-
-        res_status = status.E200
-        if user.block_behaviour == BlockBehaviourEnum.return_5xx:
-            res_status = status.E502
-
-        return [(True, res_status)]
-
-    
-    msg, dmarc_delivery_status = apply_dmarc_policy_for_forward_phase(
-        alias, contact, envelope, msg
-    )
-    if dmarc_delivery_status is not None:
-        return [(False, dmarc_delivery_status)]
-
-    ret = []
-    mailboxes = alias.mailboxes
-
     
     if not mailboxes:
         LOG.w("no valid mailboxes for %s", alias)
@@ -638,3 +612,205 @@ def handle_forward(envelope, msg: Message, rcpt_to: str) -> List[Tuple[bool, str
             )
 
     return ret
+
+
+    def forward_email_to_mailbox(
+    alias,
+    msg: Message,
+    contact: Contact,
+    envelope,
+    mailbox,
+    user,
+    reply_to_contact: Optional[Contact],
+) -> (bool, str):
+    LOG.d("Forward %s -> %s -> %s", contact, alias, mailbox)
+
+    if mailbox.disabled:
+        LOG.d("%s disabled, do not forward")
+        if should_ignore_bounce(envelope.mail_from):
+            return True, status.E207
+        else:
+            return False, status.E518
+
+    
+    if get_email_domain_part(alias.email) == get_email_domain_part(mailbox.email):
+        LOG.w(
+            "Mailbox has the same domain as alias. %s -> %s -> %s",
+            contact,
+            alias,
+            mailbox,
+        )
+        mailbox_url = f"{URL}/dashboard/mailbox/{mailbox.id}/"
+        send_email_with_rate_control(
+            user,
+            ALERT_MAILBOX_IS_ALIAS,
+            user.email,
+            f"Your mailbox {mailbox.email} and alias {alias.email} use the same domain",
+            render(
+                "transactional/mailbox-invalid.txt.jinja2",
+                user=mailbox.user,
+                mailbox=mailbox,
+                mailbox_url=mailbox_url,
+                alias=alias,
+            ),
+            render(
+                "transactional/mailbox-invalid.html",
+                user=mailbox.user,
+                mailbox=mailbox,
+                mailbox_url=mailbox_url,
+                alias=alias,
+            ),
+            max_nb_alert=1,
+        )
+
+        return False, status.E405
+
+    email_log = EmailLog.create(
+        contact_id=contact.id,
+        user_id=user.id,
+        mailbox_id=mailbox.id,
+        alias_id=contact.alias_id,
+        message_id=str(msg[headers.MESSAGE_ID]),
+        commit=True,
+    )
+    LOG.d("Create %s for %s, %s, %s", email_log, contact, user, mailbox)
+
+    if ENABLE_SPAM_ASSASSIN:
+        
+        spam_status = ""
+        is_spam = False
+
+        if SPAMASSASSIN_HOST:
+            start = time.time()
+            spam_score, spam_report = get_spam_score(msg, email_log)
+            LOG.d(
+                "%s -> %s - spam score:%s in %s seconds. Spam report %s",
+                contact,
+                alias,
+                spam_score,
+                time.time() - start,
+                spam_report,
+            )
+            email_log.spam_score = spam_score
+            Session.commit()
+
+            if (user.max_spam_score and spam_score > user.max_spam_score) or (
+                not user.max_spam_score and spam_score > MAX_SPAM_SCORE
+            ):
+                is_spam = True
+                
+                email_log.spam_report = spam_report
+        else:
+            is_spam, spam_status = get_spam_info(msg, max_score=user.max_spam_score)
+
+        if is_spam:
+            LOG.w(
+                "Email detected as spam. %s -> %s. Spam Score: %s, Spam Report: %s",
+                contact,
+                alias,
+                email_log.spam_score,
+                email_log.spam_report,
+            )
+            email_log.is_spam = True
+            email_log.spam_status = spam_status
+            Session.commit()
+
+            handle_spam(contact, alias, msg, user, mailbox, email_log)
+            return False, status.E519
+
+    if contact.invalid_email:
+        LOG.d("add noreply information %s %s", alias, mailbox)
+        msg = add_header(
+            msg,
+            f"""Email sent to {alias.email} from an invalid address and cannot be replied""",
+            f"""Email sent to {alias.email} from an invalid address and cannot be replied""",
+        )
+
+    headers_to_keep = [
+        headers.FROM,
+        headers.TO,
+        headers.CC,
+        headers.SUBJECT,
+        headers.DATE,
+        
+        headers.MESSAGE_ID,
+        
+        headers.REFERENCES,
+        headers.IN_REPLY_TO,
+        headers.SL_QUEUE_ID,
+        headers.LIST_UNSUBSCRIBE,
+        headers.LIST_UNSUBSCRIBE_POST,
+    ] + headers.MIME_HEADERS
+    if user.include_header_email_header:
+        headers_to_keep.append(headers.AUTHENTICATION_RESULTS)
+    delete_all_headers_except(msg, headers_to_keep)
+
+    if mailbox.generic_subject:
+        LOG.d("Use a generic subject for %s", mailbox)
+        orig_subject = msg[headers.SUBJECT]
+        orig_subject = get_header_unicode(orig_subject)
+        add_or_replace_header(msg, "Subject", mailbox.generic_subject)
+        sender = msg[headers.FROM]
+        sender = get_header_unicode(sender)
+        msg = add_header(
+            msg,
+            f"""Forwarded by Login to {alias.email} from "{sender}" with "{orig_subject}" as subject""",
+            f"""Forwarded by Login to {alias.email} from "{sender}" with <b>{orig_subject}</b> as subject""",
+        )
+
+    
+    if mailbox.pgp_enabled() and user.is_premium() and not alias.disable_pgp:
+        LOG.d("Encrypt message using mailbox %s", mailbox)
+
+        try:
+            msg = prepare_pgp_message(
+                msg, mailbox.pgp_finger_print, mailbox.pgp_public_key, can_sign=True
+            )
+        except PGPException:
+            LOG.w(
+                "Cannot encrypt message %s -> %s. %s %s", contact, alias, mailbox, user
+            )
+            msg = add_header(
+                msg,
+                f"""PGP encryption fails with {mailbox.email}'s PGP key""",
+            )
+
+    
+    add_or_replace_header(msg, headers.SL_DIRECTION, "Forward")
+
+    msg[headers.SL_EMAIL_LOG_ID] = str(email_log.id)
+    if user.include_header_email_header:
+        msg[headers.SL_ENVELOPE_FROM] = envelope.mail_from
+        if contact.name:
+            original_from = f"{contact.name} <{contact.website_email}>"
+        else:
+            original_from = contact.website_email
+        msg[headers.SL_ORIGINAL_FROM] = original_from
+    
+    msg[headers.SL_ENVELOPE_TO] = alias.email
+
+    if not msg[headers.DATE]:
+        LOG.w("missing date header, create one")
+        msg[headers.DATE] = formatdate()
+
+    replace_sl_message_id_by_original_message_id(msg)
+
+    old_from_header = msg[headers.FROM]
+    new_from_header = contact.new_addr()
+    add_or_replace_header(msg, "From", new_from_header)
+    LOG.d("From header, new:%s, old:%s", new_from_header, old_from_header)
+
+    if reply_to_contact:
+        reply_to_header = msg[headers.REPLY_TO]
+        new_reply_to_header = reply_to_contact.new_addr()
+        add_or_replace_header(msg, "Reply-To", new_reply_to_header)
+        LOG.d("Reply-To header, new:%s, old:%s", new_reply_to_header, reply_to_header)
+
+    try:
+        replace_header_when_forward(msg, alias, headers.CC)
+        replace_header_when_forward(msg, alias, headers.TO)
+    except CannotCreateContactForReverseAlias:
+        LOG.d("CannotCreateContactForReverseAlias error, delete %s", email_log)
+        EmailLog.delete(email_log.id)
+        Session.commit()
+        raise
