@@ -1210,29 +1210,6 @@ def replace_original_message_id(alias: Alias, email_log: EmailLog, msg: Message)
         msg[headers.REFERENCES] = " ".join(new_message_ids)
 
 
-def get_mailbox_from_mail_from(mail_from: str, alias) -> Optional[Mailbox]:
-
-
-    def __check(email_address: str, alias: Alias) -> Optional[Mailbox]:
-        for mailbox in alias.mailboxes:
-            if mailbox.email == email_address:
-                return mailbox
-
-            for authorized_address in mailbox.authorized_addresses:
-                if authorized_address.email == email_address:
-                    LOG.d(
-                        "Found an authorized address for %s %s %s",
-                        alias,
-                        mailbox,
-                        authorized_address,
-                    )
-                    return mailbox
-        return None
-
-    
-    
-    return __check(mail_from, alias) or __check(canonicalize_email(mail_from), alias)
-
 
 def handle_unknown_mailbox(
     envelope, msg, reply_email: str, user: User, alias: Alias, contact: Contact
@@ -1950,3 +1927,236 @@ def handle(envelope: Envelope, msg: Message) -> str:
         
         if handle_yahoo_complaint(msg):
             return status.E210
+
+    if rate_limited(mail_from, rcpt_tos):
+        LOG.w("Rate Limiting applied for mail_from:%s rcpt_tos:%s", mail_from, rcpt_tos)
+
+        
+        if len(rcpt_tos) == 1:
+            alias = Alias.get_by(email=rcpt_tos[0])
+            if alias:
+                LOG.w(
+                    "total number email log on %s, %s is %s, %s",
+                    alias,
+                    alias.user,
+                    EmailLog.filter(EmailLog.alias_id == alias.id).count(),
+                    EmailLog.filter(EmailLog.user_id == alias.user_id).count(),
+                )
+
+        if should_ignore_bounce(envelope.mail_from):
+            return status.E207
+        else:
+            return status.E522
+
+    
+    if len(rcpt_tos) == 1 and is_reverse_alias(rcpt_tos[0]) and mail_from == "<>":
+        contact = Contact.get_by(reply_email=rcpt_tos[0])
+        LOG.w(
+            "out-of-office email to reverse alias %s. Saved to %s",
+            contact,
+            save_email_for_debugging(msg),  
+        )
+        return status.E206
+
+    
+    
+    res: [(bool, str)] = []
+
+    nb_rcpt_tos = len(rcpt_tos)
+    for rcpt_index, rcpt_to in enumerate(rcpt_tos):
+        if rcpt_to in config.NOREPLIES:
+            LOG.i("email sent to {} address from {}".format(NOREPLY, mail_from))
+            send_no_reply_response(mail_from, msg)
+            return status.E200
+
+        
+        
+        if rcpt_index < nb_rcpt_tos - 1:
+            LOG.d("copy message for rcpt %s", rcpt_to)
+            copy_msg = copy(msg)
+        else:
+            copy_msg = msg
+
+        
+        if is_reverse_alias(rcpt_to):
+            LOG.d(
+                "Reply phase %s(%s) -> %s", mail_from, copy_msg[headers.FROM], rcpt_to
+            )
+            is_delivered, smtp_status = handle_reply(envelope, copy_msg, rcpt_to)
+            res.append((is_delivered, smtp_status))
+        else:  
+            LOG.d(
+                "Forward phase %s(%s) -> %s",
+                mail_from,
+                copy_msg[headers.FROM],
+                rcpt_to,
+            )
+            for is_delivered, smtp_status in handle_forward(
+                envelope, copy_msg, rcpt_to
+            ):
+                res.append((is_delivered, smtp_status))
+
+    
+    nb_success = len([is_success for (is_success, smtp_status) in res if is_success])
+    
+    nb_non_success = len(
+        [
+            is_success
+            for (is_success, smtp_status) in res
+            if not is_success and smtp_status != status.E518
+        ]
+    )
+
+    if nb_success > 0 and nb_non_success > 0:
+        LOG.e(f"some deliveries fail and some success, {mail_from}, {rcpt_tos}, {res}")
+
+    for is_success, smtp_status in res:
+        
+        if is_success:
+            return smtp_status
+
+    
+    return res[0][1]
+
+
+def handle_out_of_office_reply_phase(email_log, envelope, msg, rcpt_tos):
+
+    LOG.d(
+        "send the out-of-office email to the alias %s, old to_header:%s rcpt_tos:%s, %s",
+        email_log.alias,
+        msg[headers.TO],
+        rcpt_tos,
+        email_log,
+    )
+    alias_address = email_log.alias.email
+
+    rcpt_tos[0] = alias_address
+    envelope.rcpt_tos = [alias_address]
+
+    add_or_replace_header(msg, headers.TO, alias_address)
+    
+    delete_header(msg, headers.REPLY_TO)
+
+    LOG.d(
+        "after out-of-office transformation to_header:%s reply_to:%s rcpt_tos:%s",
+        msg.get_all(headers.TO),
+        msg.get_all(headers.REPLY_TO),
+        rcpt_tos,
+    )
+
+
+def handle_out_of_office_forward_phase(email_log, envelope, msg, rcpt_tos):
+
+    LOG.d(
+        "send the out-of-office email to the contact %s, old to_header:%s rcpt_tos:%s %s",
+        email_log.contact,
+        msg[headers.TO],
+        rcpt_tos,
+        email_log,
+    )
+    reverse_alias = email_log.contact.reply_email
+
+    rcpt_tos[0] = reverse_alias
+    envelope.rcpt_tos = [reverse_alias]
+
+    add_or_replace_header(msg, headers.TO, reverse_alias)
+    
+    delete_header(msg, headers.REPLY_TO)
+
+    LOG.d(
+        "after out-of-office transformation to_header:%s reply_to:%s rcpt_tos:%s",
+        msg.get_all(headers.TO),
+        msg.get_all(headers.REPLY_TO),
+        rcpt_tos,
+    )
+
+
+class MailHandler:
+    async def handle_DATA(self, server, session, envelope: Envelope):
+        msg = email.message_from_bytes(envelope.original_content)
+        try:
+            ret = self._handle(envelope, msg)
+            return ret
+        
+        except CannotCreateContactForReverseAlias as e:
+            LOG.w(
+                "Probably due to reverse-alias used in the forward phase, "
+                "error:%s mail_from:%s, rcpt_tos:%s, header_from:%s, header_to:%s",
+                e,
+                envelope.mail_from,
+                envelope.rcpt_tos,
+                msg[headers.FROM],
+                msg[headers.TO],
+            )
+            return status.E524
+        except (VERPReply, VERPForward, VERPTransactional) as e:
+            LOG.w(
+                "email handling fail with error:%s "
+                "mail_from:%s, rcpt_tos:%s, header_from:%s, header_to:%s",
+                e,
+                envelope.mail_from,
+                envelope.rcpt_tos,
+                msg[headers.FROM],
+                msg[headers.TO],
+            )
+            return status.E213
+        except Exception as e:
+            LOG.e(
+                "email handling fail with error:%s "
+                "mail_from:%s, rcpt_tos:%s, header_from:%s, header_to:%s, saved to %s",
+                e,
+                envelope.mail_from,
+                envelope.rcpt_tos,
+                msg[headers.FROM],
+                msg[headers.TO],
+                save_envelope_for_debugging(
+                    envelope, file_name_prefix=e.__class__.__name__
+                ),  
+            )
+            return status.E404
+
+    @newrelic.agent.background_task()
+    def _handle(self, envelope: Envelope, msg: Message):
+        start = time.time()
+
+        
+        message_id = str(uuid.uuid4())
+        set_message_id(message_id)
+
+        LOG.d("====>=====>====>====>====>====>====>====>")
+        LOG.i(
+            "New message, mail from %s, rctp tos %s ",
+            envelope.mail_from,
+            envelope.rcpt_tos,
+        )
+        newrelic.agent.record_custom_metric(
+            "Custom/nb_rcpt_tos", len(envelope.rcpt_tos)
+        )
+
+        with create_light_app().app_context():
+            return_status = handle(envelope, msg)
+            elapsed = time.time() - start
+            
+            spamd_result = SpamdResult.extract_from_headers(msg)
+            if return_status[0] == "5":
+                if spamd_result and spamd_result.spf in (
+                    SPFCheckResult.fail,
+                    SPFCheckResult.soft_fail,
+                ):
+                    LOG.i(
+                        "Replacing 5XX to 216 status because the return-path failed the spf check"
+                    )
+                    return_status = status.E216
+
+            LOG.i(
+                "Finish mail_from %s, rcpt_tos %s, takes %s seconds with return code '%s'<<===",
+                envelope.mail_from,
+                envelope.rcpt_tos,
+                elapsed,
+                return_status,
+            )
+
+            SpamdResult.send_to_new_relic(msg)
+            newrelic.agent.record_custom_metric("Custom/email_handler_time", elapsed)
+            newrelic.agent.record_custom_metric("Custom/number_incoming_email", 1)
+            return return_status
