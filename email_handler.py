@@ -1906,28 +1906,6 @@ def handle(envelope: Envelope, msg: Message) -> str:
         return handle_bounce(envelope, email_log, msg)
 
     
-    if (
-        len(rcpt_tos) == 1
-        and mail_from == "staff@hotmail.com"
-        and rcpt_tos[0] == POSTMASTER
-    ):
-        LOG.w("Handle hotmail complaint")
-
-        
-        if handle_hotmail_complaint(msg):
-            return status.E208
-
-    if (
-        len(rcpt_tos) == 1
-        and mail_from == "feedback@arf.mail.yahoo.com"
-        and rcpt_tos[0] == POSTMASTER
-    ):
-        LOG.w("Handle yahoo complaint")
-
-        
-        if handle_yahoo_complaint(msg):
-            return status.E210
-
     if rate_limited(mail_from, rcpt_tos):
         LOG.w("Rate Limiting applied for mail_from:%s rcpt_tos:%s", mail_from, rcpt_tos)
 
@@ -2160,3 +2138,27 @@ class MailHandler:
             newrelic.agent.record_custom_metric("Custom/email_handler_time", elapsed)
             newrelic.agent.record_custom_metric("Custom/number_incoming_email", 1)
             return return_status
+
+def main(port: int):
+    controller = Controller(MailHandler(), hostname="0.0.0.0", port=port)
+
+    controller.start()
+    LOG.d("Start mail controller %s %s", controller.hostname, controller.port)
+
+    if LOAD_PGP_EMAIL_HANDLER:
+        LOG.w("LOAD PGP keys")
+        load_pgp_public_keys()
+
+    while True:
+        time.sleep(2)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "-p", "--port", help="SMTP port to listen for", type=int, default=20381
+    )
+    args = parser.parse_args()
+
+    LOG.i("Listen for port %s", args.port)
+    main(port=args.port)
