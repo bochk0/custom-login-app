@@ -895,21 +895,7 @@ def handle_reply(envelope, msg: Message, rcpt_to: str) -> (bool, str):
 
     
     mailbox = get_mailbox_from_mail_from(mail_from, alias)
-    if not mailbox:
-        if alias.disable_email_spoofing_check:
-            
-            LOG.w(
-                "ignore unknown sender to reverse-alias %s: %s -> %s",
-                mail_from,
-                alias,
-                contact,
-            )
-            mailbox = alias.mailbox
-        else:
-            
-            handle_unknown_mailbox(envelope, msg, reply_email, user, alias, contact)
-            
-            return False, status.E214
+
 
     if ENFORCE_SPF and mailbox.force_spf and not alias.disable_email_spoofing_check:
         if not spf_pass(envelope, mailbox, user, alias, contact.website_email, msg):
@@ -1577,3 +1563,195 @@ def handle_spam(
 
     refused_email_url = f"{URL}/dashboard/refused_email?highlight_id={email_log.id}"
     disable_alias_link = f"{URL}/dashboard/unsubscribe/{alias.id}"
+
+    if is_reply:
+        LOG.d(
+            "Inform %s (%s) about spam email sent from alias %s to %s. %s",
+            mailbox,
+            user,
+            alias,
+            contact,
+            refused_email,
+        )
+        send_email_with_rate_control(
+            user,
+            ALERT_SPAM_EMAIL,
+            mailbox.email,
+            f"Email from {alias.email} to {contact.website_email} is detected as spam",
+            render(
+                "transactional/spam-email-reply-phase.txt",
+                user=user,
+                alias=alias,
+                website_email=contact.website_email,
+                disable_alias_link=disable_alias_link,
+                refused_email_url=refused_email_url,
+            ),
+            render(
+                "transactional/spam-email-reply-phase.html",
+                user=user,
+                alias=alias,
+                website_email=contact.website_email,
+                disable_alias_link=disable_alias_link,
+                refused_email_url=refused_email_url,
+            ),
+        )
+    else:
+        
+        LOG.d(
+            "Inform %s (%s) about spam email sent by %s to alias %s",
+            mailbox,
+            user,
+            contact,
+            alias,
+        )
+        send_email_with_rate_control(
+            user,
+            ALERT_SPAM_EMAIL,
+            mailbox.email,
+            f"Email from {contact.website_email} to {alias.email} is detected as spam",
+            render(
+                "transactional/spam-email.txt",
+                user=user,
+                alias=alias,
+                website_email=contact.website_email,
+                disable_alias_link=disable_alias_link,
+                refused_email_url=refused_email_url,
+            ),
+            render(
+                "transactional/spam-email.html",
+                user=user,
+                alias=alias,
+                website_email=contact.website_email,
+                disable_alias_link=disable_alias_link,
+                refused_email_url=refused_email_url,
+            ),
+        )
+
+
+def is_automatic_out_of_office(msg: Message) -> bool:
+
+    if msg[headers.AUTO_SUBMITTED] is None:
+        return False
+
+    if msg[headers.AUTO_SUBMITTED].lower() in ("auto-replied", "auto-generated"):
+        LOG.d(
+            "out-of-office email %s:%s",
+            headers.AUTO_SUBMITTED,
+            msg[headers.AUTO_SUBMITTED],
+        )
+        return True
+
+    return False
+
+
+def is_bounce(envelope: Envelope, msg: Message):
+    """Detect whether an email is a Delivery Status Notification"""
+    return (
+        envelope.mail_from == "<>"
+        and msg.get_content_type().lower() == "multipart/report"
+    )
+
+
+def handle_transactional_bounce(
+    envelope: Envelope, msg, rcpt_to, transactional_id=None
+):
+    LOG.d("handle transactional bounce sent to %s", rcpt_to)
+    if transactional_id is None:
+        LOG.i(
+            f"No transactional record for {envelope.mail_from} -> {envelope.rcpt_tos}"
+        )
+        return
+
+    transactional = TransactionalEmail.get(transactional_id)
+    
+    if not transactional:
+        LOG.i(
+            f"No transactional record for {envelope.mail_from} -> {envelope.rcpt_tos}"
+        )
+        return
+    LOG.i("Create bounce for %s", transactional.email)
+    bounce_info = get_mailbox_bounce_info(msg)
+    if bounce_info:
+        Bounce.create(
+            email=transactional.email,
+            info=bounce_info.as_bytes().decode(),
+            commit=True,
+        )
+    else:
+        LOG.w("cannot get bounce info, debug at %s", save_email_for_debugging(msg))
+        Bounce.create(email=transactional.email, commit=True)
+
+
+def handle_bounce(envelope, email_log: EmailLog, msg: Message) -> str:
+
+    if not email_log:
+        LOG.w("No such email log")
+        return status.E512
+
+    contact: Contact = email_log.contact
+    alias = contact.alias
+    LOG.d(
+        "handle bounce for %s, phase=%s, contact=%s, alias=%s",
+        email_log,
+        email_log.get_phase(),
+        contact,
+        alias,
+    )
+    if not email_log.user.is_active():
+        LOG.d(f"User {email_log.user} is not active")
+        return status.E510
+
+    if email_log.is_reply:
+        content_type = msg.get_content_type().lower()
+
+        if content_type != "multipart/report" or envelope.mail_from != "<>":
+            
+            LOG.i(
+                "Handle auto reply %s %s",
+                content_type,
+                envelope.mail_from,
+            )
+
+            contact: Contact = email_log.contact
+            alias = contact.alias
+
+            email_log.auto_replied = True
+            Session.commit()
+
+            
+            add_or_replace_header(msg, "To", alias.email)
+            envelope.rcpt_tos = [alias.email]
+
+            
+            
+            
+            res: [(bool, str)] = []
+
+            for is_delivered, smtp_status in handle_forward(envelope, msg, alias.email):
+                res.append((is_delivered, smtp_status))
+
+            for is_success, smtp_status in res:
+                
+                if is_success:
+                    return smtp_status
+
+            
+            return res[0][1]
+
+        handle_bounce_reply_phase(envelope, msg, email_log)
+        return status.E212
+    else:  
+        handle_bounce_forward_phase(msg, email_log)
+        return status.E211
+
+
+def should_ignore(mail_from: str, rcpt_tos: List[str]) -> bool:
+    if len(rcpt_tos) != 1:
+        return False
+
+    rcpt_to = rcpt_tos[0]
+    if IgnoredEmail.get_by(mail_from=mail_from, rcpt_to=rcpt_to):
+        return True
+
+    return False
+
