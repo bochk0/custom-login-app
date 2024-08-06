@@ -1084,27 +1084,7 @@ def handle_reply(envelope, msg: Message, rcpt_to: str) -> (bool, str):
             replace_header_when_reply(msg, alias, headers.TO)
 
         replace_header_when_reply(msg, alias, headers.CC)
-    except NonReverseAliasInReplyPhase as e:
-        LOG.w("non reverse-alias in reply %s %s %s", e, contact, alias)
 
-        
-        EmailLog.delete(email_log.id, commit=True)
-
-        send_email(
-            mailbox.email,
-            f"Email sent to {contact.email} contains non reverse-alias addresses",
-            render(
-                "transactional/non-reverse-alias-reply-phase.txt.jinja2",
-                user=alias.user,
-                destination=contact.email,
-                alias=alias.email,
-                subject=msg[headers.SUBJECT],
-            ),
-        )
-        
-        return True, status.E200
-
-    replace_original_message_id(alias, email_log, msg)
 
     if not msg[headers.DATE]:
         date_header = formatdate()
@@ -1207,3 +1187,204 @@ def replace_original_message_id(alias: Alias, email_log: EmailLog, msg: Message)
         if matching:
             sl_message_id = matching.sl_message_id
             LOG.d("reuse the sl_message_id %s", sl_message_id)
+            else:
+            sl_message_id = make_msgid(
+                str(email_log.id), get_email_domain_part(alias.email)
+            )
+            LOG.d("create a new sl_message_id %s", sl_message_id)
+            try:
+                MessageIDMatching.create(
+                    sl_message_id=sl_message_id,
+                    original_message_id=original_message_id,
+                    email_log_id=email_log.id,
+                    commit=True,
+                )
+            except IntegrityError:
+                LOG.w(
+                    "another matching with original_message_id %s was created in the mean time",
+                    original_message_id,
+                )
+                Session.rollback()
+                matching = MessageIDMatching.get_by(
+                    original_message_id=original_message_id
+                )
+                sl_message_id = matching.sl_message_id
+    else:
+        sl_message_id = make_msgid(
+            str(email_log.id), get_email_domain_part(alias.email)
+        )
+        LOG.d("no original_message_id, create a new sl_message_id %s", sl_message_id)
+
+    del msg[headers.MESSAGE_ID]
+    msg[headers.MESSAGE_ID] = sl_message_id
+
+    email_log.sl_message_id = sl_message_id
+    Session.commit()
+
+    
+    if msg[headers.REFERENCES]:
+        message_ids = str(msg[headers.REFERENCES]).split()
+        new_message_ids = []
+        for message_id in message_ids:
+            matching = MessageIDMatching.get_by(original_message_id=message_id)
+            if matching:
+                LOG.d(
+                    "replace original message id by SL one, %s -> %s",
+                    message_id,
+                    matching.sl_message_id,
+                )
+                new_message_ids.append(matching.sl_message_id)
+            else:
+                new_message_ids.append(message_id)
+
+        del msg[headers.REFERENCES]
+        msg[headers.REFERENCES] = " ".join(new_message_ids)
+
+
+def get_mailbox_from_mail_from(mail_from: str, alias) -> Optional[Mailbox]:
+
+
+    def __check(email_address: str, alias: Alias) -> Optional[Mailbox]:
+        for mailbox in alias.mailboxes:
+            if mailbox.email == email_address:
+                return mailbox
+
+            for authorized_address in mailbox.authorized_addresses:
+                if authorized_address.email == email_address:
+                    LOG.d(
+                        "Found an authorized address for %s %s %s",
+                        alias,
+                        mailbox,
+                        authorized_address,
+                    )
+                    return mailbox
+        return None
+
+    
+    
+    return __check(mail_from, alias) or __check(canonicalize_email(mail_from), alias)
+
+
+def handle_unknown_mailbox(
+    envelope, msg, reply_email: str, user: User, alias: Alias, contact: Contact
+):
+    LOG.w(
+        "Reply email can only be used by mailbox. "
+        "Actual mail_from: %s. msg from header: %s, reverse-alias %s, %s %s %s",
+        envelope.mail_from,
+        msg[headers.FROM],
+        reply_email,
+        alias,
+        user,
+        contact,
+    )
+
+    authorize_address_link = (
+        f"{URL}/dashboard/mailbox/{alias.mailbox_id}/
+    )
+    mailbox_emails = [mailbox.email for mailbox in alias.mailboxes]
+    send_email_with_rate_control(
+        user,
+        ALERT_REVERSE_ALIAS_UNKNOWN_MAILBOX,
+        user.email,
+        f"Attempt to use your alias {alias.email} from {envelope.mail_from}",
+        render(
+            "transactional/reply-must-use-personal-email.txt",
+            user=user,
+            alias=alias,
+            sender=envelope.mail_from,
+            authorize_address_link=authorize_address_link,
+            mailbox_emails=mailbox_emails,
+        ),
+        render(
+            "transactional/reply-must-use-personal-email.html",
+            user=user,
+            alias=alias,
+            sender=envelope.mail_from,
+            authorize_address_link=authorize_address_link,
+            mailbox_emails=mailbox_emails,
+        ),
+    )
+
+
+def handle_bounce_forward_phase(msg: Message, email_log: EmailLog):
+
+    contact = email_log.contact
+    alias = contact.alias
+    user = alias.user
+    mailbox = email_log.mailbox
+
+    
+    if not mailbox:
+        LOG.e("Use %s default mailbox %s", alias, alias.mailbox)
+        mailbox = alias.mailbox
+
+    bounce_info = get_mailbox_bounce_info(msg)
+    if bounce_info:
+        Bounce.create(
+            email=mailbox.email, info=bounce_info.as_bytes().decode(), commit=True
+        )
+    else:
+        LOG.w("cannot get bounce info, debug at %s", save_email_for_debugging(msg))
+        Bounce.create(email=mailbox.email, commit=True)
+
+    LOG.d(
+        "Handle forward bounce %s -> %s -> %s. %s", contact, alias, mailbox, email_log
+    )
+
+    
+    random_name = str(uuid.uuid4())
+
+    full_report_path = f"refused-emails/full-{random_name}.eml"
+    s3.upload_email_from_bytesio(
+        full_report_path, BytesIO(message_to_bytes(msg)), f"full-{random_name}"
+    )
+
+    file_path = None
+
+    orig_msg = get_orig_message_from_bounce(msg)
+    if not orig_msg:
+        
+        
+        LOG.w(
+            "Cannot parse original message from bounce message %s %s %s %s",
+            alias,
+            user,
+            contact,
+            full_report_path,
+        )
+    else:
+        file_path = f"refused-emails/{random_name}.eml"
+        s3.upload_email_from_bytesio(
+            file_path, BytesIO(message_to_bytes(orig_msg)), random_name
+        )
+
+    refused_email = RefusedEmail.create(
+        path=file_path, full_report_path=full_report_path, user_id=user.id
+    )
+    Session.flush()
+    LOG.d("Create refused email %s", refused_email)
+
+    email_log.bounced = True
+    email_log.refused_email_id = refused_email.id
+    email_log.bounced_mailbox_id = mailbox.id
+    Session.commit()
+
+    refused_email_url = f"{URL}/dashboard/refused_email?highlight_id={email_log.id}"
+
+    alias_will_be_disabled, reason = should_disable(alias)
+    if alias_will_be_disabled:
+        LOG.w(
+            f"Disable alias {alias} because {reason}. {alias.mailboxes} {alias.user}. Last contact {contact}"
+        )
+        change_alias_status(alias, enabled=False)
+
+        Notification.create(
+            user_id=user.id,
+            title=f"{alias.email} has been disabled due to multiple bounces",
+            message=Notification.render(
+                "notification/alias-disable.html", alias=alias, mailbox=mailbox
+            ),
+        )
+
+        Session.commit()
