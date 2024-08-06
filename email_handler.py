@@ -847,23 +847,6 @@ def handle_forward(envelope, msg: Message, rcpt_to: str) -> List[Tuple[bool, str
         return True, status.E200
 
 
-def replace_sl_message_id_by_original_message_id(msg):
-    
-    if msg[headers.IN_REPLY_TO]:
-        matching: MessageIDMatching = MessageIDMatching.get_by(
-            sl_message_id=str(msg[headers.IN_REPLY_TO])
-        )
-        if matching:
-            LOG.d(
-                "replace SL message id by original one in in-reply-to header, %s -> %s",
-                msg[headers.IN_REPLY_TO],
-                matching.original_message_id,
-            )
-            del msg[headers.IN_REPLY_TO]
-            msg[headers.IN_REPLY_TO] = matching.original_message_id
-
-
-
 def handle_reply(envelope, msg: Message, rcpt_to: str) -> (bool, str):
 
     reply_email = rcpt_to
@@ -1388,3 +1371,209 @@ def handle_bounce_forward_phase(msg: Message, email_log: EmailLog):
         )
 
         Session.commit()
+        send_email_with_rate_control(
+            user,
+            ALERT_BOUNCE_EMAIL,
+            user.email,
+            f"Alias {alias.email} has been disabled due to multiple bounces",
+            render(
+                "transactional/bounce/automatic-disable-alias.txt",
+                user=alias.user,
+                alias=alias,
+                refused_email_url=refused_email_url,
+                mailbox_email=mailbox.email,
+            ),
+            render(
+                "transactional/bounce/automatic-disable-alias.html",
+                user=alias.user,
+                alias=alias,
+                refused_email_url=refused_email_url,
+                mailbox_email=mailbox.email,
+            ),
+            max_nb_alert=10,
+            ignore_smtp_error=True,
+        )
+    else:
+        LOG.d(
+            "Inform user %s about a bounce from contact %s to alias %s",
+            user,
+            contact,
+            alias,
+        )
+        disable_alias_link = f"{URL}/dashboard/unsubscribe/{alias.id}"
+        block_sender_link = f"{URL}/dashboard/alias_contact_manager/{alias.id}?highlight_contact_id={contact.id}"
+
+        Notification.create(
+            user_id=user.id,
+            title=f"Email from {contact.website_email} to {alias.email} cannot be delivered to {mailbox.email}",
+            message=Notification.render(
+                "notification/bounce-forward-phase.html",
+                alias=alias,
+                website_email=contact.website_email,
+                disable_alias_link=disable_alias_link,
+                refused_email_url=refused_email.get_url(),
+                mailbox_email=mailbox.email,
+                block_sender_link=block_sender_link,
+            ),
+            commit=True,
+        )
+        send_email_with_rate_control(
+            user,
+            ALERT_BOUNCE_EMAIL,
+            user.email,
+            f"An email sent to {alias.email} cannot be delivered to your mailbox",
+            render(
+                "transactional/bounce/bounced-email.txt.jinja2",
+                user=alias.user,
+                alias=alias,
+                website_email=contact.website_email,
+                disable_alias_link=disable_alias_link,
+                block_sender_link=block_sender_link,
+                refused_email_url=refused_email_url,
+                mailbox_email=mailbox.email,
+            ),
+            render(
+                "transactional/bounce/bounced-email.html",
+                user=alias.user,
+                alias=alias,
+                website_email=contact.website_email,
+                disable_alias_link=disable_alias_link,
+                refused_email_url=refused_email_url,
+                mailbox_email=mailbox.email,
+            ),
+            max_nb_alert=10,
+            
+            ignore_smtp_error=True,
+        )
+
+
+def handle_bounce_reply_phase(envelope, msg: Message, email_log: EmailLog):
+
+    contact: Contact = email_log.contact
+    alias = contact.alias
+    user = alias.user
+    mailbox = email_log.mailbox or alias.mailbox
+
+    LOG.d("Handle reply bounce %s -> %s -> %s.%s", mailbox, alias, contact, email_log)
+
+    bounce_info = get_mailbox_bounce_info(msg)
+    if bounce_info:
+        Bounce.create(
+            email=sanitize_email(contact.website_email, not_lower=True),
+            info=bounce_info.as_bytes().decode(),
+            commit=True,
+        )
+    else:
+        LOG.w("cannot get bounce info, debug at %s", save_email_for_debugging(msg))
+        Bounce.create(
+            email=sanitize_email(contact.website_email, not_lower=True), commit=True
+        )
+
+    
+    
+    random_name = str(uuid.uuid4())
+
+    full_report_path = f"refused-emails/full-{random_name}.eml"
+    s3.upload_email_from_bytesio(
+        full_report_path, BytesIO(message_to_bytes(msg)), random_name
+    )
+
+    orig_msg = get_orig_message_from_bounce(msg)
+    file_path = None
+    if orig_msg:
+        file_path = f"refused-emails/{random_name}.eml"
+        s3.upload_email_from_bytesio(
+            file_path, BytesIO(message_to_bytes(orig_msg)), random_name
+        )
+
+    refused_email = RefusedEmail.create(
+        path=file_path, full_report_path=full_report_path, user_id=user.id, commit=True
+    )
+    LOG.d("Create refused email %s", refused_email)
+
+    email_log.bounced = True
+    email_log.refused_email_id = refused_email.id
+
+    email_log.bounced_mailbox_id = mailbox.id
+
+    Session.commit()
+
+    refused_email_url = f"{URL}/dashboard/refused_email?highlight_id={email_log.id}"
+
+    LOG.d(
+        "Inform user %s about bounced email sent by %s to %s",
+        user,
+        alias,
+        contact,
+    )
+    Notification.create(
+        user_id=user.id,
+        title=f"Email cannot be sent to { contact.email } from your alias { alias.email }",
+        message=Notification.render(
+            "notification/bounce-reply-phase.html",
+            alias=alias,
+            contact=contact,
+            refused_email_url=refused_email.get_url(),
+        ),
+        commit=True,
+    )
+    send_email_with_rate_control(
+        user,
+        ALERT_BOUNCE_EMAIL_REPLY_PHASE,
+        mailbox.email,
+        f"Email cannot be sent to { contact.email } from your alias { alias.email }",
+        render(
+            "transactional/bounce/bounce-email-reply-phase.txt",
+            user=user,
+            alias=alias,
+            contact=contact,
+            refused_email_url=refused_email_url,
+        ),
+        render(
+            "transactional/bounce/bounce-email-reply-phase.html",
+            user=user,
+            alias=alias,
+            contact=contact,
+            refused_email_url=refused_email_url,
+        ),
+    )
+
+
+def handle_spam(
+    contact: Contact,
+    alias: Alias,
+    msg: Message,
+    user: User,
+    mailbox: Mailbox,
+    email_log: EmailLog,
+    is_reply=False,  
+):
+    
+    orig_msg = get_orig_message_from_spamassassin_report(msg)
+    
+    random_name = str(uuid.uuid4())
+
+    full_report_path = f"spams/full-{random_name}.eml"
+    s3.upload_email_from_bytesio(
+        full_report_path, BytesIO(message_to_bytes(msg)), random_name
+    )
+
+    file_path = None
+    if orig_msg:
+        file_path = f"spams/{random_name}.eml"
+        s3.upload_email_from_bytesio(
+            file_path, BytesIO(message_to_bytes(orig_msg)), random_name
+        )
+
+    refused_email = RefusedEmail.create(
+        path=file_path, full_report_path=full_report_path, user_id=user.id
+    )
+    Session.flush()
+
+    email_log.refused_email_id = refused_email.id
+    Session.commit()
+
+    LOG.d("Create spam email %s", refused_email)
+
+    refused_email_url = f"{URL}/dashboard/refused_email?highlight_id={email_log.id}"
+    disable_alias_link = f"{URL}/dashboard/unsubscribe/{alias.id}"
