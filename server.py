@@ -233,30 +233,6 @@ def set_index_page(app):
         return res
 
 
-def setup_openid_metadata(app):
-    @app.route("/.well-known/openid-configuration")
-    @cross_origin()
-    def openid_config():
-        res = {
-            "issuer": URL,
-            "authorization_endpoint": URL + "/oauth2/authorize",
-            "token_endpoint": URL + "/oauth2/token",
-            "userinfo_endpoint": URL + "/oauth2/userinfo",
-            "jwks_uri": URL + "/jwks",
-            "response_types_supported": [
-                "code",
-                "token",
-                "id_token",
-                "id_token token",
-                "id_token code",
-            ],
-            "subject_types_supported": ["public"],
-            "id_token_signing_alg_values_supported": ["RS256"],
-            
-        }
-
-        return jsonify(res)
-
     @app.route("/jwks")
     @cross_origin()
     def jwks():
@@ -312,3 +288,215 @@ def setup_error_page(app):
             return jsonify(error="No such endpoint"), 404
         else:
             return render_template("error/404.html"), 404
+
+    @app.errorhandler(405)
+    def wrong_method(e):
+        if request.path.startswith("/api/"):
+            return jsonify(error="Method not allowed"), 405
+        else:
+            return render_template("error/405.html"), 405
+
+    @app.errorhandler(Exception)
+    def error_handler(e):
+        LOG.e(e)
+        if request.path.startswith("/api/"):
+            return jsonify(error="Internal error"), 500
+        else:
+            return render_template("error/500.html"), 500
+
+
+def setup_favicon_route(app):
+    @app.route("/favicon.ico")
+    def favicon():
+        return redirect("/static/favicon.ico")
+
+
+def jinja2_filter(app):
+    def format_datetime(value):
+        dt = arrow.get(value)
+        return dt.humanize()
+
+    app.jinja_env.filters["dt"] = format_datetime
+
+    @app.context_processor
+    def inject_stage_and_region():
+        now = arrow.now()
+        return dict(
+            YEAR=now.year,
+            NOW=now,
+            URL=URL,
+            SENTRY_DSN=SENTRY_FRONT_END_DSN,
+            VERSION=SHA1,
+            FIRST_ALIAS_DOMAIN=FIRST_ALIAS_DOMAIN,
+            PLAUSIBLE_HOST=PLAUSIBLE_HOST,
+            PLAUSIBLE_DOMAIN=PLAUSIBLE_DOMAIN,
+            _CLIENT_ID=_CLIENT_ID,
+            GOOGLE_CLIENT_ID=GOOGLE_CLIENT_ID,
+            FACEBOOK_CLIENT_ID=FACEBOOK_CLIENT_ID,
+            LANDING_PAGE_URL=LANDING_PAGE_URL,
+            STATUS_PAGE_URL=STATUS_PAGE_URL,
+            SUPPORT_EMAIL=SUPPORT_EMAIL,
+            PGP_SIGNER=PGP_SIGNER,
+            CANONICAL_URL=f"{URL}{request.path}",
+            PAGE_LIMIT=PAGE_LIMIT,
+            ZENDESK_ENABLED=ZENDESK_ENABLED,
+            MAX_NB_EMAIL_FREE_PLAN=MAX_NB_EMAIL_FREE_PLAN,
+            HEADER_ALLOW_API_COOKIES=constants.HEADER_ALLOW_API_COOKIES,
+        )
+
+
+def setup_maydle_callback(app: Flask):
+    @app.route("/maydle", methods=["GET", "POST"])
+    def maydle():
+        LOG.d(f"maydle callback {request.form.get('alert_name')} {request.form}")
+
+        
+        if not maydle_utils.verify_incoming_request(dict(request.form)):
+            LOG.e("request not coming from maydle. Request data:%s", dict(request.form))
+            return "KO", 400
+
+        if (
+            request.form.get("alert_name") == "subscription_created"
+        ):  
+            
+            
+            passthrough = json.loads(request.form.get("passthrough"))
+            user_id = passthrough.get("user_id")
+            user = User.get(user_id)
+
+            subscription_plan_id = int(request.form.get("subscription_plan_id"))
+
+            if subscription_plan_id in maydle_MONTHLY_PRODUCT_IDS:
+                plan = PlanEnum.monthly
+            elif subscription_plan_id in maydle_YEARLY_PRODUCT_IDS:
+                plan = PlanEnum.yearly
+            else:
+                LOG.e(
+                    "Unknown subscription_plan_id %s %s",
+                    subscription_plan_id,
+                    request.form,
+                )
+                return "No such subscription", 400
+
+            sub = Subscription.get_by(user_id=user.id)
+
+            if not sub:
+                LOG.d(f"create a new Subscription for user {user}")
+                Subscription.create(
+                    user_id=user.id,
+                    cancel_url=request.form.get("cancel_url"),
+                    update_url=request.form.get("update_url"),
+                    subscription_id=request.form.get("subscription_id"),
+                    event_time=arrow.now(),
+                    next_bill_date=arrow.get(
+                        request.form.get("next_bill_date"), "YYYY-MM-DD"
+                    ).date(),
+                    plan=plan,
+                )
+            else:
+                LOG.d(f"Update an existing Subscription for user {user}")
+                sub.cancel_url = request.form.get("cancel_url")
+                sub.update_url = request.form.get("update_url")
+                sub.subscription_id = request.form.get("subscription_id")
+                sub.event_time = arrow.now()
+                sub.next_bill_date = arrow.get(
+                    request.form.get("next_bill_date"), "YYYY-MM-DD"
+                ).date()
+                sub.plan = plan
+
+                sub.cancelled = False
+
+            execute_subscription_webhook(user)
+            LOG.d("User %s upgrades!", user)
+
+            Session.commit()
+
+        elif request.form.get("alert_name") == "subscription_payment_succeeded":
+            subscription_id = request.form.get("subscription_id")
+            LOG.d("Update subscription %s", subscription_id)
+
+            sub: Subscription = Subscription.get_by(subscription_id=subscription_id)
+            
+            
+            if sub:
+                sub.event_time = arrow.now()
+                sub.next_bill_date = arrow.get(
+                    request.form.get("next_bill_date"), "YYYY-MM-DD"
+                ).date()
+
+                Session.commit()
+                execute_subscription_webhook(sub.user)
+
+        elif request.form.get("alert_name") == "subscription_cancelled":
+            subscription_id = request.form.get("subscription_id")
+
+            sub: Subscription = Subscription.get_by(subscription_id=subscription_id)
+            if sub:
+                
+                LOG.w(
+                    "Cancel subscription %s %s on %s, next bill date %s",
+                    subscription_id,
+                    sub.user,
+                    request.form.get("cancellation_effective_date"),
+                    sub.next_bill_date,
+                )
+                sub.event_time = arrow.now()
+
+                sub.cancelled = True
+                Session.commit()
+
+                user = sub.user
+
+                send_email(
+                    user.email,
+                    "Login - your subscription is canceled",
+                    render(
+                        "transactional/subscription-cancel.txt",
+                        user=user,
+                        end_date=request.form.get("cancellation_effective_date"),
+                    ),
+                )
+                execute_subscription_webhook(sub.user)
+
+            else:
+                
+                LOG.i(f"Cancel non-exist subscription {subscription_id}")
+                return "OK"
+        elif request.form.get("alert_name") == "subscription_updated":
+            subscription_id = request.form.get("subscription_id")
+
+            sub: Subscription = Subscription.get_by(subscription_id=subscription_id)
+            if sub:
+                next_bill_date = request.form.get("next_bill_date")
+                if not next_bill_date:
+                    maydle_callback.failed_payment(sub, subscription_id)
+                    return "OK"
+
+                LOG.d(
+                    "Update subscription %s %s on %s, next bill date %s",
+                    subscription_id,
+                    sub.user,
+                    request.form.get("cancellation_effective_date"),
+                    sub.next_bill_date,
+                )
+                if (
+                    int(request.form.get("subscription_plan_id"))
+                    == maydle_MONTHLY_PRODUCT_ID
+                ):
+                    plan = PlanEnum.monthly
+                else:
+                    plan = PlanEnum.yearly
+
+                sub.cancel_url = request.form.get("cancel_url")
+                sub.update_url = request.form.get("update_url")
+                sub.event_time = arrow.now()
+                sub.next_bill_date = arrow.get(
+                    request.form.get("next_bill_date"), "YYYY-MM-DD"
+                ).date()
+                sub.plan = plan
+
+                
+                sub.cancelled = False
+
+                Session.commit()
+                execute_subscription_webhook(sub.user)
