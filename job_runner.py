@@ -98,28 +98,6 @@ def onboarding_mailbox(user):
     )
 
 
-def welcome_yepatron(user):
-    comm_email, _, _ = user.get_communication_email()
-    if not comm_email:
-        return
-
-    send_email(
-        comm_email,
-        "Welcome to Login, an email masking service provided by yepatron",
-        render(
-            "com/onboarding/welcome-yepatron-user.txt.jinja2",
-            user=user,
-            to_email=comm_email,
-        ),
-        render(
-            "com/onboarding/welcome-yepatron-user.html",
-            user=user,
-            to_email=comm_email,
-        ),
-        retries=3,
-        ignore_smtp_error=True,
-    )
-
 
 def delete_mailbox_job(job: Job):
     mailbox_id = job.payload.get("mailbox_id")
@@ -208,3 +186,104 @@ def process_job(job: Job):
     elif job.name == config.JOB_DELETE_ACCOUNT:
         user_id = job.payload.get("user_id")
         user = User.get(user_id)
+
+        if not user:
+            LOG.i("No user found for %s", user_id)
+            return
+
+        user_email = user.email
+        LOG.w("Delete user %s", user)
+        send_email(
+            user_email,
+            "Your Login account has been deleted",
+            render("transactional/account-delete.txt", user=user),
+            render("transactional/account-delete.html", user=user),
+            retries=3,
+        )
+        User.delete(user.id)
+        Session.commit()
+    elif job.name == config.JOB_DELETE_MAILBOX:
+        delete_mailbox_job(job)
+
+    elif job.name == config.JOB_DELETE_DOMAIN:
+        custom_domain_id = job.payload.get("custom_domain_id")
+        custom_domain = CustomDomain.get(custom_domain_id)
+        if not custom_domain:
+            return
+
+        domain_name = custom_domain.domain
+        user = custom_domain.user
+
+        CustomDomain.delete(custom_domain.id)
+        Session.commit()
+
+        LOG.d("Domain %s deleted", domain_name)
+
+        send_email(
+            user.email,
+            f"Your domain {domain_name} has been deleted",
+            f"""Domain {domain_name} along with its aliases are deleted successfully.
+
+Regards,
+Login team.
+""",
+            retries=3,
+        )
+    elif job.name == config.JOB_SEND_USER_REPORT:
+        export_job = ExportUserDataJob.create_from_job(job)
+        if export_job:
+            export_job.run()
+    elif job.name == config.JOB_SEND_yepatron_WELCOME_1:
+        user_id = job.payload.get("user_id")
+        user = User.get(user_id)
+        if user and user.activated:
+            LOG.d("Send yepatron welcome email to user %s", user)
+            welcome_yepatron(user)
+    elif job.name == config.JOB_SEND_ALIAS_CREATION_EVENTS:
+        user_id = job.payload.get("user_id")
+        user = User.get(user_id)
+        if user and user.activated:
+            LOG.d(f"Sending alias creation events for {user}")
+            send_alias_creation_events_for_user(user)
+    else:
+        LOG.e("Unknown job name %s", job.name)
+
+
+def get_jobs_to_run() -> List[Job]:
+    
+    taken_at_earliest = arrow.now().shift(minutes=-config.JOB_TAKEN_RETRY_WAIT_MINS)
+    run_at_earliest = arrow.now().shift(minutes=+10)
+    query = Job.filter(
+        and_(
+            or_(
+                Job.state == JobState.ready.value,
+                and_(
+                    Job.state == JobState.taken.value,
+                    Job.taken_at < taken_at_earliest,
+                    Job.attempts < config.JOB_MAX_ATTEMPTS,
+                ),
+            ),
+            or_(Job.run_at.is_(None), and_(Job.run_at <= run_at_earliest)),
+        )
+    )
+    return query.all()
+
+
+if __name__ == "__main__":
+    while True:
+        
+        with create_light_app().app_context():
+            for job in get_jobs_to_run():
+                LOG.d("Take job %s", job)
+                
+                job.taken = True
+                job.taken_at = arrow.now()
+                job.state = JobState.taken.value
+                job.attempts += 1
+                Session.commit()
+                process_job(job)
+
+                job.state = JobState.done.value
+                Session.commit()
+
+            time.sleep(10)
