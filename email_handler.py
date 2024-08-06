@@ -1628,21 +1628,6 @@ def handle_spam(
         )
 
 
-def is_automatic_out_of_office(msg: Message) -> bool:
-
-    if msg[headers.AUTO_SUBMITTED] is None:
-        return False
-
-    if msg[headers.AUTO_SUBMITTED].lower() in ("auto-replied", "auto-generated"):
-        LOG.d(
-            "out-of-office email %s:%s",
-            headers.AUTO_SUBMITTED,
-            msg[headers.AUTO_SUBMITTED],
-        )
-        return True
-
-    return False
-
 
 def is_bounce(envelope: Envelope, msg: Message):
     """Detect whether an email is a Delivery Status Notification"""
@@ -1755,3 +1740,213 @@ def should_ignore(mail_from: str, rcpt_tos: List[str]) -> bool:
 
     return False
 
+
+    def send_no_reply_response(mail_from: str, msg: Message):
+    mailbox = Mailbox.get_by(email=mail_from)
+    if not mailbox:
+        LOG.d("Unknown sender. Skipping reply from {}".format(NOREPLY))
+        return
+    if not mailbox.user.is_active():
+        LOG.d(f"User {mailbox.user} is soft-deleted. Skipping sending reply response")
+        return
+    send_email_at_most_times(
+        mailbox.user,
+        ALERT_TO_NOREPLY,
+        mailbox.user.email,
+        "Auto: {}".format(msg[headers.SUBJECT] or "No subject"),
+        render("transactional/noreply.text.jinja2", user=mailbox.user),
+    )
+
+
+def handle(envelope: Envelope, msg: Message) -> str:
+
+    
+    mail_from = sanitize_email(envelope.mail_from)
+    rcpt_tos = [sanitize_email(rcpt_to) for rcpt_to in envelope.rcpt_tos]
+    envelope.mail_from = mail_from
+    envelope.rcpt_tos = rcpt_tos
+
+    
+    if headers.CONTENT_TRANSFER_ENCODING not in msg:
+        LOG.i("Set CONTENT_TRANSFER_ENCODING")
+        msg[headers.CONTENT_TRANSFER_ENCODING] = "7bit"
+
+    postfix_queue_id = get_queue_id(msg)
+    if postfix_queue_id:
+        set_message_id(postfix_queue_id)
+    else:
+        LOG.d(
+            "Cannot parse Postfix queue ID from %s %s",
+            msg.get_all(headers.RECEIVED),
+            msg[headers.RECEIVED],
+        )
+
+    if should_ignore(mail_from, rcpt_tos):
+        LOG.w("Ignore email mail_from=%s rcpt_to=%s", mail_from, rcpt_tos)
+        return status.E204
+
+    
+    sanitize_header(msg, headers.FROM)
+    sanitize_header(msg, headers.TO)
+    sanitize_header(msg, headers.CC)
+    sanitize_header(msg, headers.REPLY_TO)
+    sanitize_header(msg, headers.MESSAGE_ID)
+
+    LOG.d(
+        "==>> Handle mail_from:%s, rcpt_tos:%s, header_from:%s, header_to:%s, "
+        "cc:%s, reply-to:%s, message_id:%s, client_ip:%s, headers:%s, mail_options:%s, rcpt_options:%s",
+        mail_from,
+        rcpt_tos,
+        msg[headers.FROM],
+        msg[headers.TO],
+        msg[headers.CC],
+        msg[headers.REPLY_TO],
+        msg[headers.MESSAGE_ID],
+        msg[headers.SL_CLIENT_IP],
+        msg._headers,
+        envelope.mail_options,
+        envelope.rcpt_options,
+    )
+
+    
+    email_sent_from_reverse_alias = False
+    contact = Contact.get_by(reply_email=mail_from)
+    if contact:
+        email_sent_from_reverse_alias = True
+
+    from_header = get_header_unicode(msg[headers.FROM])
+    if from_header:
+        try:
+            _, from_header_address = parse_full_address(from_header)
+        except ValueError:
+            LOG.w("cannot parse the From header %s", from_header)
+        else:
+            contact = Contact.get_by(reply_email=from_header_address)
+            if contact:
+                email_sent_from_reverse_alias = True
+
+    if email_sent_from_reverse_alias:
+        LOG.w(f"email sent from reverse alias {contact} {contact.alias} {contact.user}")
+        user = contact.user
+        send_email_at_most_times(
+            user,
+            ALERT_FROM_ADDRESS_IS_REVERSE_ALIAS,
+            user.email,
+            "Login shouldn't be used with another email forwarding system",
+            render(
+                "transactional/email-sent-from-reverse-alias.txt.jinja2",
+                user=user,
+            ),
+        )
+
+    
+    if UNSUBSCRIBER and (rcpt_tos == [UNSUBSCRIBER] or rcpt_tos == [OLD_UNSUBSCRIBER]):
+        LOG.d("Handle unsubscribe request from %s", mail_from)
+        return UnsubscribeHandler().handle_unsubscribe_from_message(envelope, msg)
+
+    
+    verp_info = get_verp_info_from_email(rcpt_tos[0])
+
+    
+    if (
+        len(rcpt_tos) == 1
+        and rcpt_tos[0].startswith(TRANSACTIONAL_BOUNCE_PREFIX)
+        and rcpt_tos[0].endswith(TRANSACTIONAL_BOUNCE_SUFFIX)
+    ) or (verp_info and verp_info[0] == VerpType.transactional):
+        if is_bounce(envelope, msg):
+            handle_transactional_bounce(
+                envelope, msg, rcpt_tos[0], verp_info and verp_info[1]
+            )
+            return status.E205
+        elif is_automatic_out_of_office(msg):
+            LOG.d(
+                "Ignore out-of-office for transactional emails. Headers: %s", msg.items
+            )
+            return status.E206
+        else:
+            raise VERPTransactional
+
+    
+    if (
+        len(rcpt_tos) == 1
+        and rcpt_tos[0].startswith(BOUNCE_PREFIX)
+        and rcpt_tos[0].endswith(BOUNCE_SUFFIX)
+    ) or (verp_info and verp_info[0] == VerpType.bounce_forward):
+        email_log_id = (verp_info and verp_info[1]) or parse_id_from_bounce(rcpt_tos[0])
+        email_log = EmailLog.get(email_log_id)
+
+        if not email_log:
+            LOG.w("No such email log")
+            return status.E512
+
+        if is_bounce(envelope, msg):
+            return handle_bounce(envelope, email_log, msg)
+        elif is_automatic_out_of_office(msg):
+            handle_out_of_office_forward_phase(email_log, envelope, msg, rcpt_tos)
+        else:
+            raise VERPForward
+
+    
+    if (
+        len(rcpt_tos) == 1
+        and rcpt_tos[0].startswith(f"{BOUNCE_PREFIX_FOR_REPLY_PHASE}+")
+        or (verp_info and verp_info[0] == VerpType.bounce_reply)
+    ):
+        email_log_id = (verp_info and verp_info[1]) or parse_id_from_bounce(rcpt_tos[0])
+        email_log = EmailLog.get(email_log_id)
+
+        if not email_log:
+            LOG.w("No such email log")
+            return status.E512
+
+        
+        if is_bounce(envelope, msg):
+            return handle_bounce(envelope, email_log, msg)
+        elif is_automatic_out_of_office(msg):
+            handle_out_of_office_reply_phase(email_log, envelope, msg, rcpt_tos)
+        else:
+            raise VERPReply(
+                f"cannot handle email sent to reply VERP, "
+                f"{email_log.alias} -> {email_log.contact} ({email_log}, {email_log.user}"
+            )
+
+    
+    verp_info = get_verp_info_from_email(mail_from[0])
+    if (
+        len(rcpt_tos) == 1
+        and mail_from.startswith(BOUNCE_PREFIX)
+        and mail_from.endswith(BOUNCE_SUFFIX)
+    ) or (verp_info and verp_info[0] == VerpType.bounce_forward):
+        email_log_id = (verp_info and verp_info[1]) or parse_id_from_bounce(mail_from)
+        email_log = EmailLog.get(email_log_id)
+        alias = Alias.get_by(email=rcpt_tos[0])
+        LOG.w(
+            "iCloud bounces %s %s, saved to%s",
+            email_log,
+            alias,
+            save_email_for_debugging(msg, file_name_prefix="icloud_bounce_"),
+        )
+        return handle_bounce(envelope, email_log, msg)
+
+    
+    if (
+        len(rcpt_tos) == 1
+        and mail_from == "staff@hotmail.com"
+        and rcpt_tos[0] == POSTMASTER
+    ):
+        LOG.w("Handle hotmail complaint")
+
+        
+        if handle_hotmail_complaint(msg):
+            return status.E208
+
+    if (
+        len(rcpt_tos) == 1
+        and mail_from == "feedback@arf.mail.yahoo.com"
+        and rcpt_tos[0] == POSTMASTER
+    ):
+        LOG.w("Handle yahoo complaint")
+
+        
+        if handle_yahoo_complaint(msg):
+            return status.E210
