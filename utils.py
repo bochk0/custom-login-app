@@ -387,29 +387,6 @@ def all_bounce_report() -> str:
     return res
 
 
-def alias_creation_report() -> List[Tuple[str, int]]:
-    
-    min_dt = arrow.now().shift(days=-7)
-    query = (
-        Session.query(
-            User.email,
-            func.count(Alias.id).label("count"),
-            func.date(Alias.created_at).label("date"),
-        )
-        .join(Alias, Alias.user_id == User.id)
-        .filter(Alias.created_at > min_dt)
-        .group_by(User.email, "date")
-        .having(func.count(Alias.id) > 50)
-        .order_by(desc("count"))
-    )
-
-    res = []
-    for email, count, date in query:
-        res.append((email, count, date))
-
-    return res
-
-
 def stats():
 
     if not config.ADMIN_EMAIL:
@@ -556,3 +533,216 @@ def migrate_domain_trash():
     )
 
     Session.commit()
+
+    def set_custom_domain_for_alias():
+
+    sl_domains = [sl_domain.domain for sl_domain in SLDomain.all()]
+    for alias in Alias.yield_per_query().filter(Alias.custom_domain_id.is_(None)):
+        if (
+            not any(alias.email.endswith(f"@{sl_domain}") for sl_domain in sl_domains)
+            and not alias.custom_domain_id
+        ):
+            alias_domain = get_email_domain_part(alias.email)
+            custom_domain = CustomDomain.get_by(domain=alias_domain)
+            if custom_domain:
+                LOG.e("set %s for %s", custom_domain, alias)
+                alias.custom_domain_id = custom_domain.id
+            else:  
+                LOG.d("phantom domain %s %s %s", alias.user, alias, alias.enabled)
+
+    Session.commit()
+
+
+def sanitize_alias_address_name():
+    count = 0
+    
+    for alias in Alias.yield_per_query():
+        if count % 1000 == 0:
+            LOG.d("process %s", count)
+
+        count += 1
+        if sanitize_email(alias.email) != alias.email:
+            LOG.e("Alias %s email not sanitized", alias)
+
+        if alias.name and "\n" in alias.name:
+            alias.name = alias.name.replace("\n", "")
+            Session.commit()
+            LOG.e("Alias %s name contains linebreak %s", alias, alias.name)
+
+
+def sanity_check():
+    LOG.d("sanitize user email")
+    for user in User.filter_by(activated=True).all():
+        if sanitize_email(user.email) != user.email:
+            LOG.e("%s does not have sanitized email", user)
+
+    LOG.d("sanitize alias address & name")
+    sanitize_alias_address_name()
+
+    LOG.d("sanity contact address")
+    contact_email_sanity_date = arrow.get("2021-01-12")
+    for contact in Contact.yield_per_query():
+        if sanitize_email(contact.reply_email) != contact.reply_email:
+            LOG.e("Contact %s reply-email not sanitized", contact)
+
+        if (
+            sanitize_email(contact.website_email, not_lower=True)
+            != contact.website_email
+            and contact.created_at > contact_email_sanity_date
+        ):
+            LOG.e("Contact %s website-email not sanitized", contact)
+
+        if not contact.invalid_email and not is_valid_email(contact.website_email):
+            LOG.e("%s invalid email", contact)
+            contact.invalid_email = True
+    Session.commit()
+
+    LOG.d("sanitize mailbox address")
+    for mailbox in Mailbox.yield_per_query():
+        if sanitize_email(mailbox.email) != mailbox.email:
+            LOG.e("Mailbox %s address not sanitized", mailbox)
+
+    LOG.d("normalize reverse alias")
+    for contact in Contact.yield_per_query():
+        if normalize_reply_email(contact.reply_email) != contact.reply_email:
+            LOG.e(
+                "Contact %s reply email is not normalized %s",
+                contact,
+                contact.reply_email,
+            )
+
+    LOG.d("clean domain name")
+    for domain in CustomDomain.yield_per_query():
+        if domain.name and "\n" in domain.name:
+            LOG.e("Domain %s name contain linebreak %s", domain, domain.name)
+
+    LOG.d("migrate domain trash if needed")
+    migrate_domain_trash()
+
+    LOG.d("fix custom domain for alias")
+    set_custom_domain_for_alias()
+
+    LOG.d("check mailbox valid domain")
+    check_mailbox_valid_domain()
+
+    LOG.d("check mailbox valid PGP keys")
+    check_mailbox_valid_pgp_keys()
+
+    LOG.d(
+
+    )
+    for contact in (
+        Contact.yield_per_query()
+        .filter(Contact.website_email.startswith("\u200f"))
+        .all()
+    ):
+        contact.website_email = contact.website_email.replace("\u200f", "")
+        LOG.e("remove right-to-left mark (RLM) from %s", contact)
+    Session.commit()
+
+    LOG.d("Finish sanity check")
+
+
+def check_mailbox_valid_domain():
+
+    mailbox_ids = (
+        Session.query(Mailbox.id)
+        .filter(Mailbox.verified.is_(True), Mailbox.disabled.is_(False))
+        .all()
+    )
+    mailbox_ids = [e[0] for e in mailbox_ids]
+    
+    
+    for mailbox_id in mailbox_ids:
+        mailbox = Mailbox.get(mailbox_id)
+        
+        if not mailbox:
+            continue
+
+        if email_can_be_used_as_mailbox(mailbox.email):
+            LOG.d("Mailbox %s valid", mailbox)
+            mailbox.nb_failed_checks = 0
+        else:
+            mailbox.nb_failed_checks += 1
+            nb_email_log = nb_email_log_for_mailbox(mailbox)
+
+            LOG.w(
+                "issue with mailbox %s domain. 
+                mailbox,
+                mailbox.nb_alias(),
+                nb_email_log,
+            )
+
+            
+            if mailbox.nb_failed_checks == 5:
+                if mailbox.user.email != mailbox.email:
+                    send_email(
+                        mailbox.user.email,
+                        f"Mailbox {mailbox.email} is disabled",
+                        render(
+                            "transactional/disable-mailbox-warning.txt.jinja2",
+                            user=mailbox.user,
+                            mailbox=mailbox,
+                        ),
+                        render(
+                            "transactional/disable-mailbox-warning.html",
+                            user=mailbox.user,
+                            mailbox=mailbox,
+                        ),
+                        retries=3,
+                    )
+
+            
+            if mailbox.nb_failed_checks > 10 and nb_email_log > 100:
+                mailbox.disabled = True
+
+                if mailbox.user.email != mailbox.email:
+                    send_email(
+                        mailbox.user.email,
+                        f"Mailbox {mailbox.email} is disabled",
+                        render(
+                            "transactional/disable-mailbox.txt.jinja2", mailbox=mailbox
+                        ),
+                        render("transactional/disable-mailbox.html", mailbox=mailbox),
+                        retries=3,
+                    )
+
+        Session.commit()
+
+
+def check_mailbox_valid_pgp_keys():
+    mailbox_ids = (
+        Session.query(Mailbox.id)
+        .filter(
+            Mailbox.verified.is_(True),
+            Mailbox.pgp_public_key.isnot(None),
+            Mailbox.disable_pgp.is_(False),
+        )
+        .all()
+    )
+    mailbox_ids = [e[0] for e in mailbox_ids]
+    
+    
+    for mailbox_id in mailbox_ids:
+        mailbox = Mailbox.get(mailbox_id)
+        
+        if not mailbox:
+            LOG.d(f"Mailbox {mailbox_id} not found")
+            continue
+
+        LOG.d(f"Checking PGP key for {mailbox}")
+
+        try:
+            load_public_key_and_check(mailbox.pgp_public_key)
+        except PGPException:
+            LOG.i(f"{mailbox} PGP key invalid")
+            send_email(
+                mailbox.user.email,
+                f"Mailbox {mailbox.email}'s PGP Key is invalid",
+                render(
+                    "transactional/invalid-mailbox-pgp-key.txt.jinja2",
+                    user=mailbox.user,
+                    mailbox=mailbox,
+                ),
+                retries=3,
+            )
