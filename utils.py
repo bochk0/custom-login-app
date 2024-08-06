@@ -524,22 +524,6 @@ def migrate_domain_trash():
     Session.commit()
 
 
-def sanitize_alias_address_name():
-    count = 0
-    
-    for alias in Alias.yield_per_query():
-        if count % 1000 == 0:
-            LOG.d("process %s", count)
-
-        count += 1
-        if sanitize_email(alias.email) != alias.email:
-            LOG.e("Alias %s email not sanitized", alias)
-
-        if alias.name and "\n" in alias.name:
-            alias.name = alias.name.replace("\n", "")
-            Session.commit()
-            LOG.e("Alias %s name contains linebreak %s", alias, alias.name)
-
 
 def sanity_check():
     LOG.d("sanitize user email")
@@ -928,3 +912,195 @@ async def check_hibp():
         hibp_entry = Hibp.get_or_create(name=entry["Name"])
         hibp_entry.date = arrow.get(entry["BreachDate"])
         hibp_entry.description = entry["Description"]
+
+        Session.commit()
+    LOG.d("Updated list of known breaches")
+
+    LOG.d("Getting the list of users to skip")
+    query = "select u.id, count(a.id) from users u, alias a where a.user_id=u.id group by u.id having count(a.id) > :max_alias"
+    rows = Session.execute(query, {"max_alias": config.HIBP_MAX_ALIAS_CHECK})
+    user_ids = [row[0] for row in rows]
+    LOG.d("Got %d users to skip" % len(user_ids))
+
+    LOG.d("Checking aliases")
+    queue = asyncio.Queue()
+    min_alias_id = 0
+    max_alias_id = Session.query(func.max(Alias.id)).scalar()
+    step = 10000
+    now = arrow.now()
+    oldest_hibp_allowed = now.shift(days=-config.HIBP_SCAN_INTERVAL_DAYS)
+    alias_checked = 0
+    for alias_batch_id in range(min_alias_id, max_alias_id, step):
+        for alias in get_alias_to_check_hibp(
+            oldest_hibp_allowed, user_ids, alias_batch_id, alias_batch_id + step
+        ):
+            await queue.put(alias.id)
+
+        alias_checked += queue.qsize()
+        LOG.d(
+            f"Need to check about {queue.qsize()} aliases in this loop {alias_batch_id}/{max_alias_id}"
+        )
+        
+        checkers = []
+        for i in range(len(config.HIBP_API_KEYS)):
+            checker = asyncio.create_task(
+                _hibp_check(
+                    config.HIBP_API_KEYS[i],
+                    queue,
+                )
+            )
+            checkers.append(checker)
+
+        
+        for checker in checkers:
+            await checker
+
+    LOG.d(f"Done checking {alias_checked} HIBP API for aliases in breaches")
+
+
+def notify_hibp():
+    
+    alias_query = (
+        Session.query(Alias)
+        .options(joinedload(Alias.hibp_breaches))
+        .filter(Alias.hibp_breaches.any())
+        .filter(Alias.id.notin_(Session.query(HibpNotifiedAlias.alias_id)))
+        .distinct(Alias.user_id)
+        .all()
+    )
+
+    user_ids = [alias.user_id for alias in alias_query]
+
+    for user in User.filter(User.id.in_(user_ids)):
+        breached_aliases = (
+            Session.query(Alias)
+            .options(joinedload(Alias.hibp_breaches))
+            .filter(Alias.hibp_breaches.any(), Alias.user_id == user.id)
+            .all()
+        )
+
+        LOG.d(
+            "Send new breaches found email to %s for %s breaches aliases",
+            user,
+            len(breached_aliases),
+        )
+
+        send_email(
+            user.email,
+            "You were in a data breach",
+            render(
+                "transactional/hibp-new-breaches.txt.jinja2",
+                user=user,
+                breached_aliases=breached_aliases,
+            ),
+            render(
+                "transactional/hibp-new-breaches.html",
+                user=user,
+                breached_aliases=breached_aliases,
+            ),
+            retries=3,
+        )
+
+        
+        for alias in breached_aliases:
+            HibpNotifiedAlias.create(user_id=user.id, alias_id=alias.id)
+        Session.commit()
+
+
+def clear_users_scheduled_to_be_deleted(dry_run=False):
+    users = User.filter(
+        and_(
+            User.delete_on.isnot(None),
+            User.delete_on <= arrow.now().shift(days=-DELETE_GRACE_DAYS),
+        )
+    ).all()
+    for user in users:
+        LOG.i(
+            f"Scheduled deletion of user {user} with scheduled delete on {user.delete_on}"
+        )
+        if dry_run:
+            continue
+        User.delete(user.id)
+        Session.commit()
+
+
+def delete_old_data():
+    oldest_valid = arrow.now().shift(days=-config.KEEP_OLD_DATA_DAYS)
+    cleanup_old_imports(oldest_valid)
+    cleanup_old_jobs(oldest_valid)
+    cleanup_old_notifications(oldest_valid)
+
+
+if __name__ == "__main__":
+    LOG.d("Start running cronjob")
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "-j",
+        "--job",
+        help="Choose a cron job to run",
+        type=str,
+        choices=[
+            "stats",
+            "notify_trial_end",
+            "notify_manual_subscription_end",
+            "notify_premium_end",
+            "delete_logs",
+            "delete_old_data",
+            "poll_mayple_subscription",
+            "sanity_check",
+            "delete_old_monitoring",
+            "check_custom_domain",
+            "check_hibp",
+            "notify_hibp",
+            "cleanup_tokens",
+            "send_undelivered_mails",
+        ],
+    )
+    args = parser.parse_args()
+    
+    with create_light_app().app_context():
+        if args.job == "stats":
+            LOG.d("Compute growth and daily monitoring stats")
+            stats()
+        elif args.job == "notify_trial_end":
+            LOG.d("Notify users with trial ending soon")
+            notify_trial_end()
+        elif args.job == "notify_manual_subscription_end":
+            LOG.d("Notify users with manual subscription ending soon")
+            notify_manual_sub_end()
+        elif args.job == "notify_premium_end":
+            LOG.d("Notify users with premium ending soon")
+            notify_premium_end()
+        elif args.job == "delete_logs":
+            LOG.d("Deleted Logs")
+            delete_logs()
+        elif args.job == "delete_old_data":
+            LOG.d("Delete old data")
+            delete_old_data()
+        elif args.job == "poll_mayple_subscription":
+            LOG.d("Poll mayple Subscriptions")
+            poll_mayple_subscription()
+        elif args.job == "sanity_check":
+            LOG.d("Check data consistency")
+            sanity_check()
+        elif args.job == "delete_old_monitoring":
+            LOG.d("Delete old monitoring records")
+            delete_old_monitoring()
+        elif args.job == "check_custom_domain":
+            LOG.d("Check custom domain")
+            check_custom_domain()
+        elif args.job == "check_hibp":
+            LOG.d("Check HIBP")
+            asyncio.run(check_hibp())
+        elif args.job == "notify_hibp":
+            LOG.d("Notify users about HIBP breaches")
+            notify_hibp()
+        elif args.job == "cleanup_tokens":
+            LOG.d("Cleanup expired tokens")
+            delete_expired_tokens()
+        elif args.job == "send_undelivered_mails":
+            LOG.d("Sending undelivered emails")
+            load_unsent_mails_from_fs_and_resend()
+        elif args.job == "delete_scheduled_users":
+            LOG.d("Deleting users scheduled to be deleted")
+            clear_users_scheduled_to_be_deleted(dry_run=True)
