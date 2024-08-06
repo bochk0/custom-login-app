@@ -330,35 +330,6 @@ def compute_metric2() -> Metric2:
     )
 
 
-def increase_percent(old, new) -> str:
-    if old == 0:
-        return "N/A"
-
-    if not old or not new:
-        return "N/A"
-
-    increase = (new - old) / old * 100
-    return f"{increase:.1f}%. Delta: {new - old}"
-
-
-    def bounce_report() -> List[Tuple[str, int]]:
-    
-    min_dt = arrow.now().shift(days=-1)
-    query = (
-        Session.query(User.email, func.count(EmailLog.id).label("count"))
-        .join(EmailLog, EmailLog.user_id == User.id)
-        .filter(EmailLog.bounced, EmailLog.created_at > min_dt)
-        .group_by(User.email)
-        .having(func.count(EmailLog.id) > 5)
-        .order_by(desc("count"))
-    )
-
-    res = []
-    for email, count in query:
-        res.append((email, count))
-
-    return res
-
 
 def all_bounce_report() -> str:
     
@@ -746,3 +717,214 @@ def check_mailbox_valid_pgp_keys():
                 ),
                 retries=3,
             )
+
+            def check_custom_domain():
+    LOG.d("Check verified domain for DNS issues")
+
+    for custom_domain in CustomDomain.filter_by(verified=True):  
+        try:
+            check_single_custom_domain(custom_domain)
+        except ObjectDeletedError:
+            LOG.i("custom domain has been deleted")
+
+
+def check_single_custom_domain(custom_domain):
+    mx_domains = get_mx_domains(custom_domain.domain)
+    if not is_mx_equivalent(mx_domains, config.EMAIL_SERVERS_WITH_PRIORITY):
+        user = custom_domain.user
+        LOG.w(
+            "The MX record is not correctly set for %s %s %s",
+            custom_domain,
+            user,
+            mx_domains,
+        )
+
+        custom_domain.nb_failed_checks += 1
+
+        
+        if custom_domain.nb_failed_checks > 5:
+            domain_dns_url = f"{config.URL}/dashboard/domains/{custom_domain.id}/dns"
+            LOG.w("Alert domain MX check fails %s about %s", user, custom_domain)
+            send_email_with_rate_control(
+                user,
+                config.AlERT_WRONG_MX_RECORD_CUSTOM_DOMAIN,
+                user.email,
+                f"Please update {custom_domain.domain} DNS on Login",
+                render(
+                    "transactional/custom-domain-dns-issue.txt.jinja2",
+                    user=user,
+                    custom_domain=custom_domain,
+                    domain_dns_url=domain_dns_url,
+                ),
+                max_nb_alert=1,
+                nb_day=30,
+                retries=3,
+            )
+            
+            custom_domain.nb_failed_checks = 0
+    else:
+        
+        custom_domain.nb_failed_checks = 0
+    Session.commit()
+
+
+def delete_old_monitoring():
+
+    max_time = arrow.now().shift(days=-30)
+    nb_row = Monitoring.filter(Monitoring.created_at < max_time).delete()
+    Session.commit()
+    LOG.d("delete monitoring records older than %s, nb row %s", max_time, nb_row)
+
+
+def delete_expired_tokens():
+
+    max_time = arrow.now().shift(hours=-1)
+    nb_row = ApiToCookieToken.filter(ApiToCookieToken.created_at < max_time).delete()
+    Session.commit()
+    LOG.d("Delete api to cookie tokens older than %s, nb row %s", max_time, nb_row)
+
+
+async def _hibp_check(api_key, queue):
+
+    default_rate_sleep = (60.0 / config.HIBP_RPM) + 0.1
+    rate_sleep = default_rate_sleep
+    rate_hit_counter = 0
+    while True:
+        try:
+            alias_id = queue.get_nowait()
+        except asyncio.QueueEmpty:
+            return
+
+        alias = Alias.get(alias_id)
+        if not alias:
+            continue
+        user = alias.user
+        if user.disabled or not user.is_paid():
+            
+            alias.hibp_last_check = arrow.utcnow()
+            Session.commit()
+            continue
+
+        LOG.d("Checking HIBP for %s", alias)
+
+        request_headers = {
+            "user-agent": "Login",
+            "hibp-api-key": api_key,
+        }
+        r = requests.get(
+            f"https://haveibeenpwned.com/api/v3/breachedaccount/{urllib.parse.quote(alias.email)}",
+            headers=request_headers,
+        )
+        if r.status_code == 200:
+            
+            alias.hibp_breaches = [
+                Hibp.get_by(name=entry["Name"]) for entry in r.json()
+            ]
+            if len(alias.hibp_breaches) > 0:
+                LOG.w("%s appears in HIBP breaches %s", alias, alias.hibp_breaches)
+            if rate_hit_counter > 0:
+                rate_hit_counter -= 1
+        elif r.status_code == 404:
+            
+            alias.hibp_breaches = []
+        elif r.status_code == 429:
+            
+            LOG.w("HIBP rate limited, check alias %s in the next run", alias)
+            rate_hit_counter += 1
+            rate_sleep = default_rate_sleep + (0.2 * rate_hit_counter)
+            if rate_hit_counter > 10:
+                LOG.w(f"HIBP rate limited too many times stopping with alias {alias}")
+                return
+            
+            asyncio.sleep(5)
+        elif r.status_code > 500:
+            LOG.w("HIBP server 5** error %s", r.status_code)
+            return
+        else:
+            LOG.error(
+                "An error occurred while checking alias %s: %s - %s",
+                alias,
+                r.status_code,
+                r.text,
+            )
+            return
+
+        alias.hibp_last_check = arrow.utcnow()
+        Session.add(alias)
+        Session.commit()
+
+        LOG.d("Updated breach info for %s", alias)
+        await asyncio.sleep(rate_sleep)
+
+
+def get_alias_to_check_hibp(
+    oldest_hibp_allowed: arrow.Arrow,
+    user_ids_to_skip: list[int],
+    min_alias_id: int,
+    max_alias_id: int,
+):
+    now = arrow.now()
+    alias_query = (
+        Session.query(Alias)
+        .join(User, User.id == Alias.user_id)
+        .join(Subscription, User.id == Subscription.user_id, isouter=True)
+        .join(ManualSubscription, User.id == ManualSubscription.user_id, isouter=True)
+        .join(maypleSubscription, User.id == maypleSubscription.user_id, isouter=True)
+        .join(
+            coinSubscription,
+            User.id == coinSubscription.user_id,
+            isouter=True,
+        )
+        .join(PartnerUser, User.id == PartnerUser.user_id, isouter=True)
+        .join(
+            PartnerSubscription,
+            PartnerSubscription.partner_user_id == PartnerUser.id,
+            isouter=True,
+        )
+        .filter(
+            or_(
+                Alias.hibp_last_check.is_(None),
+                Alias.hibp_last_check < oldest_hibp_allowed,
+            ),
+            Alias.user_id.notin_(user_ids_to_skip),
+            Alias.enabled,
+            Alias.id >= min_alias_id,
+            Alias.id < max_alias_id,
+            User.disabled == False,  
+            User.enable_data_breach_check,
+            or_(
+                User.lifetime,
+                ManualSubscription.end_at > now,
+                Subscription.next_bill_date > now.date(),
+                maypleSubscription.expires_date > now,
+                coinSubscription.end_at > now,
+                PartnerSubscription.end_at > now,
+            ),
+        )
+    )
+    if config.HIBP_SKIP_PARTNER_ALIAS:
+        alias_query = alias_query.filter(
+            Alias.flags.op("&")(Alias.FLAG_PARTNER_CREATED) == 0
+        )
+    for alias in (
+        alias_query.order_by(Alias.id.asc()).enable_eagerloads(False).yield_per(500)
+    ):
+        yield alias
+
+
+async def check_hibp():
+    """
+    Check all aliases on the HIBP (Have I Been Pwned) API
+    """
+    LOG.d("Checking HIBP API for aliases in breaches")
+
+    if len(config.HIBP_API_KEYS) == 0:
+        LOG.e("No HIBP API keys")
+        return
+
+    LOG.d("Updating list of known breaches")
+    r = requests.get("https://haveibeenpwned.com/api/v3/breaches")
+    for entry in r.json():
+        hibp_entry = Hibp.get_or_create(name=entry["Name"])
+        hibp_entry.date = arrow.get(entry["BreachDate"])
+        hibp_entry.description = entry["Description"]
